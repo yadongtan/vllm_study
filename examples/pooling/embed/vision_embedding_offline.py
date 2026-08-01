@@ -81,6 +81,11 @@ def run_e5_v(seed: int):
 
 
 def run_qwen3_vl(seed: int):
+    """使用动态转换的 Qwen3-VL 模型生成文本和图像的嵌入向量。
+
+    VL 表示 Vision-Language（视觉-语言）。示例中的 LLM 表示 Large Language
+    Model（大语言模型）。
+    """
     try:
         from qwen_vl_utils import smart_resize
     except ModuleNotFoundError:
@@ -113,6 +118,8 @@ def run_qwen3_vl(seed: int):
 
     llm = LLM(
         model="Qwen/Qwen3-VL-Embedding-2B",
+        # pooling runner（池化运行器）会把 Qwen3VLForConditionalGeneration
+        # 转换为嵌入模型，并返回经过池化和归一化的隐藏状态。
         runner="pooling",
         max_model_len=8192,
         limit_mm_per_prompt={"image": 1},

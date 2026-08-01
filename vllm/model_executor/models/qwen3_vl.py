@@ -1599,7 +1599,7 @@ class Qwen3LLMForCausalLM(Qwen3ForCausalLM):
     info=Qwen3VLProcessingInfo,
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
-class Qwen3VLForConditionalGeneration(
+ class Qwen3VLForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
     SupportsEncoderCudaGraph,
@@ -1610,6 +1610,22 @@ class Qwen3VLForConditionalGeneration(
     SupportsEagle3,
     SupportsMultiModalPruning,
 ):
+    """生成模型与嵌入模型检查点共用的 Qwen3-VL 骨干网络。
+
+    VL 是 Vision-Language（视觉-语言）的缩写。Qwen3-VL-Embedding 检查点在
+    Hugging Face（模型托管平台，常简称 HF）配置中声明的仍是这个生成架构。
+    选择嵌入任务后，模型加载器会通过 ``as_embedding_model`` 动态包装本类，
+    再池化 :meth:`forward` 返回的隐藏状态，因此不需要单独的 Qwen3-VL
+    嵌入模型类。
+
+    相关接口名中的缩写：CUDA 表示 Compute Unified Device Architecture
+    （统一计算设备架构）；LoRA 表示 Low-Rank Adaptation（低秩适配）；
+    PP 表示 Pipeline Parallelism（流水线并行）；MRoPE 表示 Multimodal
+    Rotary Position Embedding（多模态旋转位置编码）；EAGLE 表示
+    Extrapolation Algorithm for Greater Language-model Efficiency，是一种
+    用于提高语言模型推理效率的推测解码方法。
+    """
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -2839,6 +2855,8 @@ class Qwen3VLForConditionalGeneration(
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))
 
+        # 生成任务会把这些隐藏状态交给 compute_logits 计算 logits（未归一化的
+        # 词元预测分数）；动态转换后的嵌入模型则把它们交给 pooler（池化器）。
         return hidden_states
 
     def compute_logits(

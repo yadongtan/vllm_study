@@ -90,6 +90,13 @@ class SequencePooler(Pooler):
 
 
 def pooler_for_embed(pooler_config: PoolerConfig) -> SequencePooler:
+    """构建从隐藏状态到最终嵌入向量的转换流程。
+
+    配置指定的序列池化方法会先选择或聚合提示词序列中的 token（词元）；动态
+    转换的生成模型默认使用 LAST，即选择最后一个词元。随后，池化头会执行可选的
+    Sentence Transformers（句子向量模型框架）投影，并进行 L2（欧几里得范数）
+    归一化，使每个输出向量的 L2 范数为 1。
+    """
     pooling = get_seq_pooling_method(pooler_config.get_seq_pooling_type())
 
     vllm_config = get_current_vllm_config()

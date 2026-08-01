@@ -557,6 +557,8 @@ _MULTIMODAL_MODELS = {
         "Qwen3ASRForConditionalGeneration",
     ),
     "Qwen3ASRRealtimeGeneration": ("qwen3_asr_realtime", "Qwen3ASRRealtimeGeneration"),
+    # Qwen3-VL 的嵌入模型检查点也会解析到这里。VL 是 Vision-Language（视觉-语言）
+    # 的缩写；选择 embed（嵌入）任务后，加载器会为这个生成类包装嵌入池化器。
     "Qwen3VLForConditionalGeneration": ("qwen3_vl", "Qwen3VLForConditionalGeneration"),
     "Qwen3VLMoeForConditionalGeneration": (
         "qwen3_vl_moe",

@@ -228,21 +228,26 @@ def _create_pooling_model_cls(orig_cls: _T) -> _T:
 
 
 def as_embedding_model(cls: _T) -> _T:
-    """
-    Subclass an existing vLLM model to support embeddings.
+    """通过创建现有 vLLM 模型的子类，为其增加嵌入能力。
 
-    By default, the embeddings of the whole prompt are extracted from the
-    normalized hidden state corresponding to the last token.
+    默认从提示词序列最后一个 token（词元）对应的隐藏状态中提取整个序列的
+    嵌入向量，并对向量进行归一化。
 
-    Note:
-        We assume that no extra layers are added to the original model;
-        please implement your own model if this is not the case.
+    此包装器保留原模型的前向传播、多模态处理器和权重映射，只停用生成任务
+    专用的输出层，并挂载 embedding pooler（嵌入池化器）。因此，当嵌入模型
+    检查点的 ``architectures`` 配置指向生成类时（例如
+    Qwen3-VL-Embedding，其中 VL 表示 Vision-Language，即视觉-语言），
+    无需再实现一个专用的 Python 模型类。
+
+    注意：
+        这里假设嵌入模型没有在原模型上增加额外网络层；如果增加了额外层，
+        应当为该模型编写专用实现。
     """
-    # Avoid modifying existing embedding models
+    # 如果传入的类本身已经是池化模型，则直接返回，避免重复包装。
     if is_pooling_model(cls):
         return cls
 
-    # Lazy import
+    # 延迟导入，避免在不需要模型转换时加载池化相关模块。
     from vllm.model_executor.layers.pooler import DispatchPooler
 
     class ModelForEmbedding(_create_pooling_model_cls(cls)):
@@ -254,6 +259,8 @@ def as_embedding_model(cls: _T) -> _T:
             pooler_config = vllm_config.model_config.pooler_config
             assert pooler_config is not None
 
+            # DispatchPooler（分发池化器）使用同一份骨干网络隐藏状态，同时支持
+            # “每个提示词序列生成一个向量”和“每个 token（词元）生成一个向量”。
             return DispatchPooler.for_embedding(pooler_config)
 
     ModelForEmbedding.__name__ = _get_pooling_model_name(cls.__name__, "ForEmbedding")

@@ -201,6 +201,9 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
         pass
     elif convert_type == "embed":
         logger.debug_once("Converting to embedding model.")
+        # 复用已经解析出的骨干网络（包括多模态预处理和权重加载），并使用
+        # pooler（池化器）处理其输出。Qwen3-VL 等生成架构由此可以直接承载
+        # 原生嵌入模型检查点，而不需要单独实现一个模型类。
         model_cls = as_embedding_model(model_cls)
     elif convert_type == "classify":
         logger.debug_once("Converting to sequence classification model.")

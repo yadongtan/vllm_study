@@ -107,6 +107,7 @@ class ColQwen3ProcessingInfo(Qwen3VLProcessingInfo):
         )
 
 
+# CLS 表示 Classification Token（分类词元），ALL 表示保留所有 token（词元）。
 @default_pooling_type(seq_pooling_type="CLS", tok_pooling_type="ALL")
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,
@@ -114,22 +115,30 @@ class ColQwen3ProcessingInfo(Qwen3VLProcessingInfo):
     dummy_inputs=Qwen3VLDummyInputsBuilder,
 )
 class ColQwen3Model(Qwen3VLForConditionalGeneration, SupportsLateInteraction):
-    """ColQwen3 late interaction model for multi-modal retrieval/reranking.
+    """用于多模态检索和重排序的 ColQwen3 后期交互模型。
 
-    This model extends Qwen3VLForConditionalGeneration with a ColBERT-style
-    linear projection layer for per-token embeddings. It supports:
-    - "token_embed" task: Per-token embeddings for late interaction scoring
+    本模型在 Qwen3VLForConditionalGeneration 基础上增加了 ColBERT 风格的
+    线性投影层，用于生成逐 token（词元）嵌入。ColBERT 表示 Contextualized
+    Late Interaction over BERT（基于 BERT 的上下文化后期交互），其中 BERT
+    表示 Bidirectional Encoder Representations from Transformers
+    （基于 Transformer 的双向编码器表征）。本模型支持：
+    - ``token_embed`` 任务：为每个词元生成用于后期交互评分的嵌入向量。
 
-    The model produces L2-normalized per-token embeddings by:
-    1. Running the Qwen3-VL backbone (vision + language) to get hidden states
-    2. Projecting hidden states through a linear layer (hidden_size -> embed_dim)
-    3. L2-normalizing the projected embeddings
+    ColQwen3 沿用了 ColBERT 的 ``Col`` 命名，表示上下文化后期交互。
+    Qwen3-VL 序列嵌入模型检查点可以使用通用嵌入适配器；ColQwen3 则需要
+    这个专用类，因为它额外包含一个经过训练的投影头，改变了模型架构。
 
-    ColBERT-style MaxSim scoring is computed externally, either client-side
-    or via the late interaction scoring path in ServingScores.
+    模型通过以下步骤生成经过 L2（欧几里得范数）归一化的逐词元嵌入：
+    1. 运行 Qwen3-VL 视觉-语言骨干网络，得到隐藏状态；
+    2. 通过线性层把隐藏状态从 ``hidden_size`` 投影到 ``embed_dim``，其中
+       ``dim`` 是 dimension（维度）的缩写；
+    3. 对投影后的嵌入进行 L2 归一化，使每个向量的 L2 范数为 1。
 
-    Attributes:
-        custom_text_proj: Linear projection from hidden_size to embed_dim
+    ColBERT 风格的 MaxSim（Maximum Similarity，最大相似度）评分在模型外部
+    计算，可以由客户端完成，也可以通过 ServingScores 的后期交互评分路径完成。
+
+    属性：
+        custom_text_proj：将 ``hidden_size`` 映射到 ``embed_dim`` 的线性投影层。
     """
 
     # Mark this as a pooling model so vLLM routes to pooler path

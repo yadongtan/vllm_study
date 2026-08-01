@@ -970,31 +970,55 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
 
 class QKVParallelLinear(ColumnParallelLinear):
-    """Linear layers for the attention's QKV transformation.
+    """用于生成注意力 Q、K、V 的“融合 + 张量并行”线性层。
 
-    Linear layers for the linear transformation of the query, key, and value
-    vectors in the attention layer. The weight matrix is concatenated along
-    the output dimension. The layer is parallelized along the head dimension.
-    When the number of key/value heads is smaller than the number of query
-    heads (e.g., multi-query/grouped-query attention), the key/value head may
-    be replicated while the query heads are partitioned.
+    ``QKVParallelLinear`` 这个名称可以拆成两部分理解：
+
+    * ``QKV``：把原本独立的 ``q_proj``、``k_proj``、``v_proj`` 三个线性投影
+      融合为一个大矩阵。一次矩阵乘法得到 ``[Q | K | V]``，再由调用方切开。
+    * ``ParallelLinear``：沿输出 head 维度把这个大矩阵分到多个 TP rank/GPU，
+      每张卡只生成自己负责的 Q/K/V head，而不是生成全部 head。
+
+    它本身没有重新定义 ``forward``，实际矩阵乘法由父类
+    :class:`ColumnParallelLinear` 完成。本类的特殊工作主要是：
+
+    1. 根据 TP 大小计算每张卡有多少 Q head 和 KV head；
+    2. 决定 KV head 应该切分还是复制；
+    3. 告诉父类融合权重和本地输出应该有多大；
+    4. 加载 checkpoint 时，把 Q/K/V 权重切出本 rank 所需部分，再放进本地
+       融合矩阵的正确区间。
+
+    以下用 Qwen3-0.6B、两张 GPU、TP=2 贯穿说明。该模型的相关配置是：
+
+    ``hidden_size=1024, Q heads=16, KV heads=8, head_size=128``。
+
+    每张卡分到 8 个 Q head 和 4 个 KV head。因此，对 ``num_tokens`` 个 token，
+    每张卡上的数据流是：
+
+    ``hidden_states [num_tokens, 1024]``
+    ``-> 本地融合线性层``
+    ``-> qkv [num_tokens, 1024 + 512 + 512]``
+    ``-> Q [num_tokens, 1024], K [num_tokens, 512], V [num_tokens, 512]``。
+
+    两个 512 分别是 K 和 V 的宽度；K、V 大小相同但权重、数值和用途不同。
+    GPU 0 生成 Q head 0~7、KV head 0~3；GPU 1 生成 Q head 8~15、KV head
+    4~7。这个例子中 KV head 可以整齐切分，不需要复制。
 
     Args:
-        hidden_size: input hidden state size of the transformer.
-        head_size: size of each attention head.
-        total_num_heads: total number of attention query heads.
-        total_num_kv_heads: total number of attention key/value heads. If
-                            None, assume total_num_kv_heads = total_num_heads.
-        bias: If true, add bias.
-        skip_bias_add: This was added to enable performance optimizations where
-                       bias can be fused with other element-wise operations. we
-                       skip adding bias but instead return it.
-        params_dtype: Data type for the parameters.
-        quant_config: Quantization configure.
-        prefix: The name of the layer in the state dict, including all parents
-                        (e.g. model.layers.0.qkv_proj)
-        return_bias: If true, return bias together with outputs in forward pass.
-        disable_tp: If true, weights matrix won't be sharded through tp rank.
+        hidden_size: 输入 token 隐藏向量的宽度，本例为 1024。
+        head_size: 每个 attention head 的宽度，本例为 128。
+        total_num_heads: 所有 TP rank 合计的 Q head 数，本例为 16。
+        total_num_kv_heads: 所有 rank 合计的 K/V head 数，本例为 8。若为
+            ``None``，则令其等于 Q head 数，即使用普通 MHA 而不是 GQA/MQA。
+        bias: 是否在线性变换后加偏置。
+        skip_bias_add: 是否暂不把偏置加到输出，让后续算子有机会融合该加法。
+        params_dtype: 权重的数据类型，例如 float16 或 bfloat16。
+        quant_config: 权重量化配置；为 ``None`` 表示不使用量化线性方法。
+        prefix: state_dict 中的完整模块路径，如 ``model.layers.0.qkv_proj``。
+        return_bias: ``forward`` 是否把偏置和输出一起返回。
+        disable_tp: 为 True 时关闭 TP，不切分权重，等价于 ``tp_size=1``。
+        v_head_size: V head 的宽度。通常与 Q/K 的 ``head_size`` 相同；某些特殊
+            架构可以单独指定。
     """
 
     def __init__(
@@ -1013,34 +1037,66 @@ class QKVParallelLinear(ColumnParallelLinear):
         disable_tp: bool = False,
         v_head_size: int | None = None,
     ):
+        # 输入向量宽度。Qwen3-0.6B 的每个 token 输入有 1024 个元素。
         self.hidden_size = hidden_size
+        # Q/K 每个 head 的宽度，本例是 128。
         self.head_size = head_size
+        # 大多数模型的 V head 与 Q/K 一样宽；未单独指定时直接复用 head_size。
         self.v_head_size = v_head_size if v_head_size is not None else head_size
+        # ``total`` 表示所有 TP GPU 合起来的全局 Q head 数，而不是单卡数量。
         self.total_num_heads = total_num_heads
         if total_num_kv_heads is None:
+            # 未指定独立 KV head 数意味着每个 Q head 都有自己的 K/V，即 MHA。
             total_num_kv_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads
-        # Divide the weight matrix along the last dimension.
+
+        # TP 沿线性层输出维切权重，也就是沿 attention head 分卡。
+        # Qwen3-0.6B 两卡示例中 tp_size=2；disable_tp=True 时强制按单卡处理。
         tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
+        # divide 与普通 // 不同：除法不能整除时会直接报错，避免静默丢失 head。
+        # 本例 16 / 2 = 8，所以每张卡生成 8 个 Q head。
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
+            # GPU 数不少于 KV head 数时，每张卡至少保留 1 个 KV head，并可能
+            # 复制它。例如 2 个 KV head、4 张卡时，每个 KV head 复制到 2 张卡。
+            # Qwen3-0.6B 的两卡例子是 2 < 8，不进入这个分支。
             self.num_kv_heads = 1
+            # 表示每个全局 KV head 有多少个 GPU 副本。上例是 4 / 2 = 2。
             self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
         else:
+            # Qwen3-0.6B 两卡例子进入这里：8 个 KV head / 2 张卡 = 每卡 4 个，
+            # 权重可以直接切分，不产生副本。
             self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
             self.num_kv_head_replicas = 1
+
+        # 父类线性层看到的输入宽度仍是完整 hidden_size。本例两张卡都会收到
+        # 所需的 [num_tokens, 1024] 输入，然后各自乘本地的不同权重分片。
         input_size = self.hidden_size
+
+        # 这里先计算“所有 rank 合起来”的融合输出宽度。父类
+        # ColumnParallelLinear 会再按 tp_size 切开，所以公式最后乘 tp_size。
+        # 本例单卡输出：
+        #   Q = 8*128=1024，K = 4*128=512，V = 4*128=512，共 2048；
+        # 因此传给父类的全局 output_size = 2048*2 = 4096。
         output_size = (
             self.num_heads * self.head_size
             + self.num_kv_heads * self.head_size
             + self.num_kv_heads * self.v_head_size
         ) * tp_size
+
+        # 三个数字分别描述全局融合矩阵中 Q、K、V 三段的宽度。父类加载融合
+        # 权重时用它们定位各段。本例是 [2048, 1024, 1024]；除以 TP=2 后，
+        # 每卡实际保存的三段宽度就是 [1024, 512, 512]。
         self.output_sizes = [
             self.num_heads * self.head_size * tp_size,  # q_proj
             self.num_kv_heads * self.head_size * tp_size,  # k_proj
             self.num_kv_heads * self.v_head_size * tp_size,  # v_proj
         ]
 
+        # gather_output=False 很重要：forward 后不把两张卡的 QKV 拼成全局
+        # [num_tokens, 4096]，而是让每张卡保留本地 [num_tokens, 2048]。
+        # 因为后续注意力也按 head 并行，每张卡可以直接用自己的 Q/K/V 计算，
+        # 没必要先汇总再重新切开。
         super().__init__(
             input_size=input_size,
             output_size=output_size,
@@ -1055,6 +1111,12 @@ class QKVParallelLinear(ColumnParallelLinear):
         )
 
     def validate_shard_id(self, loaded_shard_id: str | None):
+        """检查待加载的 checkpoint 权重属于 Q、K 还是 V。
+
+        Qwen3 checkpoint 通常分别给出 ``q_proj``、``k_proj``、``v_proj``，上层
+        加载器会把它们转换为 ``"q"``、``"k"``、``"v"``。``None`` 表示磁盘
+        上本来就是一个已经融合好的 QKV 权重。
+        """
         if loaded_shard_id is None:
             return
         if isinstance(loaded_shard_id, str):
@@ -1067,6 +1129,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         raise ValueError("This line should not be reached")
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
+        """返回 Q/K/V 在“本卡融合参数”中的起始位置。
+
+        Qwen3-0.6B 两卡示例的本地布局是 ``[Q 1024 | K 512 | V 512]``，所以
+        offset 分别为 Q=0、K=1024、V=1536，total=2048。
+        """
         shard_offset_mapping = {
             "q": 0,
             "k": self.num_heads * self.head_size,
@@ -1077,6 +1144,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         return shard_offset_mapping.get(loaded_shard_id)
 
     def _get_shard_size_mapping(self, loaded_shard_id: str):
+        """返回 Q、K 或 V 在本卡融合参数中各自占用的宽度。
+
+        本例返回值分别是 Q=1024、K=512、V=512。
+        """
         shard_size_mapping = {
             "q": self.num_heads * self.head_size,
             "k": self.num_kv_heads * self.head_size,
@@ -1087,15 +1158,16 @@ class QKVParallelLinear(ColumnParallelLinear):
     def _load_fused_module_from_checkpoint(
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
-        """
-        Handle special case for models where QKV layers are already
-        fused on disk. In this case, we have no shard id. This function
-        determines the shard id by splitting these layers and then calls
-        the weight loader using the shard id.
+        """处理 checkpoint 在磁盘上已经融合 QKV 的特殊情况。
 
-        An example of a model with these fused layers:
-        https://huggingface.co/microsoft/Phi-3-mini-4k-instruct
+        此时没有 ``loaded_shard_id`` 可直接说明哪一段是 Q/K/V，因此先按照全局
+        head 数把大权重切成 Q、K、V 三段，再分别调用加载器；例如 Phi-3 的
+        checkpoint 就采用这种格式。Qwen3 常见 checkpoint 是三个独立投影，
+        但此通用类必须同时支持两种格式。
         """
+        # 这些是磁盘上“全局融合权重”的布局，并非本卡布局。Qwen3-0.6B 的
+        # 假想融合权重三段宽度为 Q=16*128=2048、K=8*128=1024、
+        # V=8*128=1024；后续 weight_loader_v2 再从每段中取得本 rank 的一半。
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
             ("q", 0, self.total_num_heads * self.head_size),
@@ -1112,6 +1184,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         ]
 
         for shard_id, shard_offset, shard_size in shard_offsets:
+            # 某些量化格式把多个数打包存储，因此张量下标不再等同于未量化的
+            # head 维下标；必须先把逻辑 offset/size 换算为实际存储下标。
             # Special case for Quantization.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
@@ -1139,6 +1213,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
+        """使用新版参数接口加载并切分 Q/K/V 权重。
+
+        ``loaded_weight`` 可能是全局 q_proj/k_proj/v_proj 中的一块，也可能是
+        已融合的完整 QKV。最终目标都是填入当前 TP rank 的本地融合参数。
+        """
         self.validate_shard_id(loaded_shard_id)
         if loaded_shard_id is None:  # special case for certain models
             if isinstance(param, PerTensorScaleParameter):
@@ -1170,6 +1249,9 @@ class QKVParallelLinear(ColumnParallelLinear):
                 weight_block_size, shard_size, shard_offset
             )
 
+        # 参数对象根据 tp_rank 从全局权重选择本卡 head，并写入由 offset/size
+        # 指定的本地 Q、K 或 V 区间。num_kv_head_replicas 还告诉它 KV 是否需要
+        # 多 rank 读取同一份权重。
         param.load_qkv_weight(
             loaded_weight=loaded_weight,
             num_heads=self.num_kv_head_replicas,
@@ -1185,6 +1267,13 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
+        """兼容旧参数接口及多种量化格式的 QKV 权重加载器。
+
+        代码较长主要不是因为 QKV 数学复杂，而是 checkpoint 可能有很多存储
+        形式：Q/K/V 分开或融合、普通浮点或量化、GGUF、BitsAndBytes、Marlin
+        等。所有分支最终都完成同一件事：找到正确 Q/K/V 段，切出当前 TP rank
+        所需的 head，并复制到本地融合参数。
+        """
         self.validate_shard_id(loaded_shard_id)
         # Special case for GGUF
         # initialize GGUF param after we know the quantize type
@@ -1218,8 +1307,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # Loaded weight is already fused on disk (qkv).
-            # (e.g., Phi-3's qkv_proj).
+            # loaded_shard_id=None 表示磁盘权重已经是 [Q | K | V] 融合格式，
+            # 例如 Phi-3 的 qkv_proj；需要按全局 head 数重新识别三段。
             if output_dim is None:
                 if needs_scalar_to_array:
                     param_data, loaded_weight = adjust_scalar_to_fused_array(
@@ -1300,6 +1389,8 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         # If output dim is defined, use the default loading process.
         if output_dim is not None:
+            # 先定位目标在本卡融合参数 [Q | K | V] 中的位置。本例：
+            # Q 写 [0:1024]，K 写 [1024:1536]，V 写 [1536:2048]。
             if loaded_shard_id == "q":
                 shard_offset = 0
                 shard_size = self.num_heads * self.head_size
@@ -1358,8 +1449,13 @@ class QKVParallelLinear(ColumnParallelLinear):
 
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             if loaded_shard_id == "q":
+                # Q head 永远按 TP rank 切成互不重叠的部分。本例 rank 0 读取
+                # Q 0~7，rank 1 读取 Q 8~15。
                 shard_rank = self.tp_rank
             else:
+                # KV 可能被复制。若 replicas=1（Qwen3-0.6B 两卡示例），两卡
+                # 分别读取 KV 0~3 与 4~7；若 replicas=2，则相邻两个 TP rank
+                # 通过整数除法得到相同 shard_rank，从而读取同一份 KV 权重。
                 shard_rank = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_rank * shard_size
 
@@ -1380,6 +1476,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                     "for all partitions."
                 )
 
+        # 经过“目标区间定位”和“源权重 TP 切片”后，两者形状必须完全一致，
+        # 才能安全复制；断言也能尽早发现模型配置与 checkpoint 不匹配。
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 

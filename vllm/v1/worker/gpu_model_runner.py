@@ -5589,6 +5589,8 @@ class GPUModelRunner(
             )
         )
 
+    # inference_mode 关闭 autograd：dummy run 只做推理，不需要保存反向传播图，
+    # 因而能减少临时内存和调度开销，也与真实 vLLM 推理模式一致。
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -5605,120 +5607,134 @@ class GPUModelRunner(
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run a dummy forward pass to warm up/profile run or capture the
-        CUDA graph for the model.
+        """用虚拟 batch 执行一次接近真实推理的模型前向。
 
-        Args:
-            num_tokens: Number of tokens to run the dummy forward pass.
-            cudagraph_runtime_mode: used to control the behavior.
-                - if not set will determine the cudagraph mode based on using
-                    the self.cudagraph_dispatcher.
-                - CUDAGraphMode.NONE: No cudagraph, for warm up and profile run
-                - CUDAGraphMode.PIECEWISE: Piecewise cudagraph.
-                - CUDAGraphMode.FULL: Full cudagraph, attention metadata is
-                    needed.
-            force_attention: If True, always create attention metadata. Used to
-                warm up attention backend when mode is NONE.
-            uniform_decode: If True, the batch is a uniform decode batch.
-            skip_eplb: If True, skip EPLB state update.
-            is_profile: If True, this is a profile run.
-            create_mixed_batch: If True, create a mixed batch with both decode
-                (1 token) and prefill (multiple tokens) requests.
-            remove_lora: If False, dummy LoRAs are not destroyed after the run
-            num_active_loras: Number of distinct active LoRAs to capture for.
-                LoRA is activated when num_active_loras > 0.
-            profile_seq_lens: If provided, use this value for seq_lens instead
-                of max_query_len. Used to profile attention workspace that
-                scales with context length.
+        ``dummy`` 表示输入不是用户请求，但它仍会走输入准备、Attention、模型
+        forward 和必要输出路径。用途包括：启动预热、触发 torch.compile、
+        画像内存、捕获 CUDA Graph，以及预热 Attention/LoRA/EPLB 等组件。
+
+        当前 Qwen2-0.5B CPU 启动的典型调用链是：
+
+        ``profile_run -> _dummy_run(max_num_tokens, is_profile=True)``
+        ``            -> Qwen2ForCausalLM.forward``
+
+        例如 ``num_tokens=8``、``max_num_seqs=4`` 时，函数可能模拟 4 条请求，
+        每条各 2 个 token；它不是发送 8 次 HTTP 请求。返回值是：
+
+        * 所有虚拟 token 的 ``hidden_states``；
+        * 每条虚拟请求最后一个 token 的 ``last_hidden_states``，供 sampler 使用。
+
+        参数说明：
+
+        * ``num_tokens``：未填充的虚拟 token 总数。
+        * ``cudagraph_runtime_mode``：NONE、PIECEWISE、FULL；None 表示自动选择。
+        * ``force_attention``：强制构建 Attention metadata 以预热注意力后端。
+        * ``uniform_decode``：模拟每条请求 query 长度相同的 Decode batch。
+        * ``allow_microbatching``：是否允许把大 batch 拆成 microbatch。
+        * ``skip_eplb``：是否跳过 MoE 专家负载均衡的虚拟状态更新。
+        * ``is_profile``：标记画像运行并强制 eager 调度包装，但不等于关闭
+          模型级 ``torch.compile``。
+        * ``create_mixed_batch``：同时模拟单 token Decode 和多 token Prefill。
+        * ``remove_lora``：运行后是否移除临时激活的 dummy LoRA。
+        * ``num_active_loras``：模拟多少个不同的活跃 LoRA，0 表示不启用。
+        * ``profile_seq_lens``：测试 Attention workspace 时指定的序列长度。
         """
+        # encoder-only 多模态模型没有语言模型 forward；当前 dummy run 只覆盖
+        # LM 路径，所以直接返回两个空张量。纯文本 Qwen2 不进入此分支。
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
-            # The current dummy run only covers LM execution, so we can skip it.
-            # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
 
+        # 显式指定 CUDA Graph 模式时必须是有效运行模式；None 表示稍后自动决定。
         assert (
             cudagraph_runtime_mode is None
             or cudagraph_runtime_mode.is_valid_runtime_mode()
         )
 
-        # If cudagraph_mode.decode_mode() == FULL and
-        # cudagraph_mode.separate_routine(). This means that we are using
-        # different graphs and/or modes for mixed prefill-decode batches vs.
-        # uniform decode batches. A uniform decode batch means that all
-        # requests have identical query length, except a potential virtual
-        # request (shorter) in the batch account for padding.
-        # Uniform decode batch could either be common pure decode, where
-        # max_query_len == 1, or speculative decode, where
-        # max_query_len == 1 + num_spec_decode_tokens.
-
-        # When setting max_query_len = 1, we switch to and capture the optimized
-        # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
-        # for GQA/MQA.
+        # uniform_decode=True 时，每条请求通常处理 1 个新 token；投机解码则可能
+        # 是 1+draft tokens。最大 query 长度为 1 时，GPU 注意力后端可选择
+        # FlashDecode 及 GQA/MQA 专用路径。否则先把整个 num_tokens 当作最大
+        # Prefill query 长度，后面再按虚拟请求数拆分。
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
 
-        # Set num_scheduled_tokens based on num_tokens and max_num_seqs
-        # for dummy run with LoRA so that the num_reqs collectively
-        # has num_tokens in total.
+        # 构造与真实 scheduler 输出相似的“每个请求本轮 token 数”列表。所有
+        # 元素之和必须等于 num_tokens，请求数不能超过 max_num_seqs。
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
+            # 混合模式不能同时声称所有请求都是相同长度的 uniform decode。
             assert not uniform_decode
-            # Create mixed batch:
-            # first half decode tokens, second half one prefill
+            # 用不超过一半的 token 构造若干 Decode 请求，每条只有 1 token；
+            # 还要为最后的一条 Prefill 请求预留一个 request slot。
             num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
             num_prefill_tokens = num_tokens - num_decode_tokens
             num_reqs = num_decode_tokens + 1
 
-            # Create decode requests (1 token each) followed by prefill request
+            # 例：num_tokens=8 时可能得到 [1,1,1,1,4]，前四项是 Decode，
+            # 最后一项是 Prefill。它们共享物理 batch，但元数据保持请求隔离。
             num_scheduled_tokens_list = [1] * num_decode_tokens + [num_prefill_tokens]
-            # Note: Overriding max_query_len to be the prefill tokens
+            # 混合 batch 最长 query 是 Prefill 部分，而不是单 token Decode。
             max_query_len = num_prefill_tokens
         elif uniform_decode:
+            # 每条虚拟 Decode 请求分配 max_query_len；最后一条可接收除法余数。
+            # cdiv 是向上取整除法，确保有足够请求容纳全部 token。
             assert not create_mixed_batch
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
         else:
+            # 普通画像把 token 尽量均匀分给最多 max_num_reqs 条虚拟请求。
+            # 例如 10 token、最多 4 请求，会得到 [2,2,2,4]。
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
             num_scheduled_tokens_list[-1] += num_tokens % num_reqs
 
+        # 两个断言防止 dummy 调度元数据自相矛盾。
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
+        # NumPy int32 数组是后续调度/padding 工具期望的格式。
         num_scheduled_tokens = np.array(num_scheduled_tokens_list, dtype=np.int32)
+        # 此时尚未 padding，所以求和仍等于调用参数 num_tokens。
         num_tokens_unpadded = int(num_scheduled_tokens.sum())
 
+        # 假设每条虚拟请求需要采样 1 个 token，供 LoRA/sampler 元数据使用。
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
+        # 根据请求分布决定执行模式、固定图所需 padding、是否拆 microbatch，
+        # 以及 DP 各 rank 的 token 数。这里只生成执行计划，还没有调用模型。
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
+                # 当前未填充 token 总数。
                 num_tokens=num_tokens_unpadded,
+                # 虚拟请求条数。
                 num_reqs=num_reqs,
+                # 每条请求本轮分别处理多少 token。
                 num_scheduled_tokens_np=num_scheduled_tokens,
+                # 单条请求最大的本轮 query 长度。
                 max_num_scheduled_tokens=max_query_len,
+                # dummy run 不启用 cascade attention 的共享前缀优化。
                 use_cascade_attn=False,
+                # 允许时可把 batch 拆成多个 microbatch 与计算/通信重叠。
                 allow_microbatching=allow_microbatching,
+                # profile 或 NONE 图模式让本轮使用 eager 调度包装，以便暴露真实
+                # 初始化/内存开销；模型内部首次 torch.compile 仍可能发生。
                 force_eager=is_profile
                 or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
-                # `force_uniform_decode` is used for cudagraph capture; because for
-                # capturing mixed prefill-decode batches, we sometimes use
-                # num_tokens == num_reqs which looks like a uniform decode batch to the
-                # dispatcher; but we actually want to capture a piecewise cudagraph
+                # 图捕获时显式告诉 dispatcher 这是 uniform decode；因为某些混合
+                # batch 恰好 num_tokens==num_reqs，仅看数字会被误判成纯 Decode。
                 force_uniform_decode=uniform_decode,
-                # `force_has_lora` is used for cudagraph capture; because LoRA is
-                # activated later in the context manager, but we need to know the
-                # LoRA state when determining the batch descriptor for capture
+                # LoRA 会在稍后的 context manager 中才真正激活，但选择图和
+                # batch descriptor 时必须提前知道是否有 LoRA。
                 force_has_lora=num_active_loras > 0,
-                # `force_num_active_loras` is used for cudagraph capture; because we
-                # need to capture graphs for specific num_active_loras counts
+                # 不同活跃 LoRA 数可能需要不同的捕获图，故同时传入具体数量。
                 force_num_active_loras=num_active_loras,
             )
         )
 
+        # None 表示接受 dispatcher 自动选择的模式；若调用者明确指定，则断言
+        # 自动结果与之相同，避免以错误模式捕获或重放 CUDA Graph。
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
         else:
@@ -5727,10 +5743,15 @@ class GPUModelRunner(
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
 
+        # 固定图/内核可能要求把形状补齐。例如真实 10 token 可能使用 16-token
+        # buffer。padding token 只占形状，不属于任何真实或虚拟请求内容。
         num_tokens_padded = batch_desc.num_tokens
+        # 部分图模式也会把请求数补齐；未规定时沿用原 num_reqs。
         num_reqs_padded = (
             batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         )
+        # 如果启用 microbatch/DBO，把大 batch 切成多个子批；函数同时返回未填充
+        # 和填充后的切片边界，保证输入与 attention metadata 使用相同布局。
         ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
             should_ubatch,
             num_scheduled_tokens,
@@ -5744,69 +5765,90 @@ class GPUModelRunner(
             ubatch_slices_padded,
         )
 
+        # 默认没有显式 attention metadata。force_attention 或 FULL 图模式会在
+        # 下面创建包含请求边界、序列长度、block table、slot mapping 等的对象。
         attn_metadata: PerLayerAttnMetadata | None = None
 
+        # 创建形状正确的 KV Cache slot 映射。dummy 请求没有真正分配 cache block，
+        # 所以下面把 slot 设为 -1，使写缓存 kernel 知道应跳过。
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+            # 包含固定图 padding 的 token 数，决定映射 buffer 形状。
             num_tokens_padded=num_tokens_padded,
+            # 包含固定图 padding 的请求数。
             num_reqs_padded=num_reqs_padded,
+            # 真正属于虚拟请求的 token 数。
             num_tokens_unpadded=num_tokens_unpadded,
+            # microbatch 模式下按各切片分别组织 slot。
             ubatch_slices=ubatch_slices_padded,
         )
 
-        # Dummy runs have no real slot assignments — fill with -1 so
-        # concat_and_cache kernels skip the KV write.
         if slot_mappings_by_group is not None:
             for sm in slot_mappings_by_group.values():
                 sm.fill_(-1)
 
-        # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
-        # etc.) with execute_model.  It must participate in the same event
-        # protocol so that back-to-back dummy/real steps don't overwrite
-        # pinned memory while a prior non_blocking H2D DMA is still reading.
+        # dummy 与真实 execute_model 共用 pinned CPU buffer，如 seq_lens 和
+        # query_start_loc。如果上一轮异步 CPU→GPU 拷贝还在读取，直接覆盖会产生
+        # 数据竞争；这个 context 会遵循同一事件同步协议。
         with self.synchronize_input_prep():
-            # If force_attention is True, we always capture attention.
-            # Otherwise, it only happens for cudagraph_runtime_mode=FULL.
+            # force_attention 用来单独预热 Attention；否则仅 FULL 图需要预先固定
+            # 完整 metadata。CPU 当前不使用 CUDA Graph，但仍复用这套通用代码。
             if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
                 if profile_seq_lens is not None:
+                    # 显式序列长度用来画像随上下文长度增长的 Attention workspace。
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
-                    # In the mixed batch mode (used for FI warmup), we use
-                    # shorter sequence lengths to run faster.
-                    # TODO(luka) better system for describing dummy batches
+                    # 混合模式中 Decode 请求长度设为 1，Prefill 请求设为其 token
+                    # 数+1。这是 FI warmup 使用的较短代表性序列，可减少启动时间。
                     seq_lens = torch.tensor(  # type: ignore[assignment]
                         [1] * num_decode_tokens + [num_prefill_tokens + 1],
                         dtype=torch.int,
                     )
                 else:
+                    # 普通模式给所有请求使用同一个代表性最大 query 长度。
                     seq_lens = max_query_len  # type: ignore[assignment]
+                # 写入前 num_reqs 行，padding/未使用请求行全部清零。
                 self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
                 self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+                # 复制到设备侧；GPU 可以异步执行，CPU 后端则等价于普通复制。
                 self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
+                # 把每请求 token 数转成累计起点。例如 [2,2,4] 得到 [0,2,4,8]，
+                # Attention 据此知道扁平 token 张量中每条请求的范围。
                 cum_num_tokens = self._get_cumsum_and_arange(
                     num_scheduled_tokens, self.query_pos.np
                 )
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
 
-                # Sync block table CPU->GPU so cleared rows from
-                # remove_request() are visible to the attention metadata
-                # builder. Without this, stale block IDs from finished
-                # requests can corrupt Mamba state.
+                # 同步 block table，使已清理行在设备侧可见；否则 metadata builder
+                # 可能读到旧 block id，进而污染 KV Cache 或 Mamba 状态。
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
+                # FULL 图使用 padded 形状固定 metadata；其他模式尽量使用未填充
+                # token/ubatch 边界，减少无效工作。
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                # 真正构建 Attention backend 所需的分层 metadata。
                 attn_metadata, _ = self._build_attention_metadata(
+                    # 未填充 token 数用于构造真实请求边界。
                     num_tokens=num_tokens_unpadded,
+                    # FULL 图才传 padded 数，使 metadata 形状与捕获图一致。
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    # Attention 看到的请求行数；可能包含图 padding 行。
                     num_reqs=num_reqs_padded,
+                    # 最长 query，后端据此选择/分配 workspace。
                     max_query_len=max_query_len,
+                    # FULL 图使用 padded microbatch 切片，否则用实际切片。
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
+                    # 捕获图时后端需要避免执行某些仅运行期允许的操作。
                     for_cudagraph_capture=is_graph_capturing,
+                    # 告诉每个新 K/V 本应写到哪里；dummy 值为 -1，实际不写。
                     slot_mappings=slot_mappings_by_group,
+                    # 投机解码会改变 query/draft token 的 metadata 布局。
                     use_spec_decode=self.speculative_config is not None,
                 )
 
+        # 在 context 内按 num_active_loras 激活形状正确的 dummy LoRA mapping，
+        # 使预热/图捕获覆盖 LoRA 额外计算；退出时是否移除由 remove_lora 控制。
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -5814,35 +5856,49 @@ class GPUModelRunner(
             remove_lora,
             num_active_loras,
         ):
-            # Make sure padding doesn't exceed max_num_tokens
+            # 即使 padding 后也不能超过初始化时分配的最大输入 buffer。
             assert num_tokens_padded <= self.max_num_tokens
+            # 初始化模型可能需要的附加 kwargs；普通 Qwen2 通常没有额外字段。
             model_kwargs = self._init_model_kwargs()
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+                # decoder-only 多模态模型可能混合 token id 与多模态 embedding。
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
+                # 补上图片/视频占位信息等 dummy 多模态参数。
                 model_kwargs = {
                     **model_kwargs,
                     **self._dummy_mm_kwargs(num_reqs),
                 }
             elif self.enable_prompt_embeds:
+                # 直接输入 prompt embedding 时不需要整数 token id。
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
                 model_kwargs = self._init_model_kwargs()
             else:
+                # 当前纯文本 Qwen2 走这里。dummy id 内容不重要，只需合法且形状
+                # 与真实运行一致；inputs_embeds=None 会让模型自己查 embedding。
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
 
             if self.uses_mrope:
+                # Qwen2-VL 等 mRoPE 模型的位置可能是 [3,num_tokens]。
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
             elif self.uses_xdrope_dim > 0:
+                # 其他多维 RoPE 变体使用自身维数的位置张量。
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
+                # 普通 Qwen2 使用一维 [num_tokens_padded] positions。
                 positions = self.positions[:num_tokens_padded]
 
+            # PP 首 rank 从 input_ids/embedding 开始，不需要上一 stage 的输出。
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
             else:
+                # 这是启动 dummy run：非首 PP rank 只需形状正确的虚拟中间张量
+                # 来预热自己的层，不必等待前一 stage 的真实语义输出。
                 if self.intermediate_tensors is None:
+                    # 首次按 max_num_tokens 创建可复用 PP buffer。Qwen2-0.5B
+                    # 通常包含 [max_num_tokens,896] 的 hidden_states 和 residual。
                     self.intermediate_tensors = (
                         self.model.make_empty_intermediate_tensors(
                             batch_size=self.max_num_tokens,
@@ -5851,18 +5907,23 @@ class GPUModelRunner(
                         )
                     )
 
+                # 截取当前 padded token 数。sync_self=False 表示没有前一 stage
+                # 发来的真实张量需要复制、all-gather 或等待。
                 intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                     num_tokens_padded, None, False
                 )
 
             if ubatch_slices_padded is not None:
-                # Adjust values to reflect a single ubatch.
-                # TODO(sage,lucas): this is cruft that should be addressed in
-                #  the padding refactor.
+                # 图捕获/预热按单个 microbatch 固定形状执行，因此改为第一个
+                # padded ubatch 的 token 数。
                 num_tokens_padded = ubatch_slices_padded[0].num_tokens
+                # DP 的各 rank token 数描述也同步为此 ubatch 大小。
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # maybe_randomize_inputs 避免编译器因全零 dummy 值过度特化；
+            # set_forward_context 把 Attention 所需 metadata、slot mapping、图模式
+            # 和 batch 描述放进当前 forward 的上下文。
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -5876,6 +5937,8 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                # 真正执行模型前向。当前 Qwen2 会经过 embedding、24 层和最终
+                # RMSNorm；dummy token 的数值结果不会返回给用户。
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -5883,17 +5946,21 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
-
+                print("ouptut[:10]: ", outputs[:10])
+            # EAGLE3 可额外返回辅助层隐藏状态；普通 Qwen2 只有一个输出张量。
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
 
+            # 投机解码还需预热 draft/proposer，否则首个真实请求会承担它的编译
+            # 和缓冲区初始化成本。当前普通 Qwen2 未启用时整段跳过。
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
             ):
+                # 配置启用的 proposer 必须属于当前 dummy_run 支持的实现类型。
                 assert isinstance(
                     self.drafter,
                     EagleProposer
@@ -5903,9 +5970,9 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
+                # EAGLE 当前只支持 PIECEWISE 图：捕获阶段必须正在捕获 PIECEWISE；
+                # 非捕获执行阶段只需主模型模式不是 NONE。draft 自身 enforce_eager
+                # 时无论如何都不能用图。
                 use_cudagraphs = (
                     (
                         is_graph_capturing
@@ -5917,16 +5984,15 @@ class GPUModelRunner(
                     )
                 ) and not self.speculative_config.enforce_eager
 
-                # Note(gnovack) - We need to disable cudagraphs for one of the two
-                # lora cases when cudagraph_specialize_lora is enabled. This is a
-                # short term mitigation for issue mentioned in
-                # https://github.com/vllm-project/vllm/issues/28334
+                # cudagraph_specialize_lora 与活跃 LoRA 组合目前有兼容限制；有
+                # dummy LoRA 时临时关闭 draft 图，优先保证正确性。
                 if (
                     self.compilation_config.cudagraph_specialize_lora
                     and num_active_loras > 0
                 ):
                     use_cudagraphs = False
 
+                # proposer 使用同样的 token 总数和 slot 形状执行虚拟前向。
                 self.drafter.dummy_run(
                     num_tokens,
                     use_cudagraphs=use_cudagraphs,
@@ -5934,31 +6000,29 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings,
                 )
 
-        # We register layerwise NVTX hooks here after the first dynamo tracing is
-        # done to avoid nvtx operations in hook functions being traced by
-        # torch dynamo and causing graph breaks.
-        # Note that for DYNAMO_ONCE and VLLM_COMPILE mode,
-        # compiled model's dynamo tracing is only done once and the compiled model's
-        # __call__ function is replaced by calling the compiled function.
-        # So it's safe to register hooks here. Hooks will be registered to
-        # both compiled and uncompiled models but they will never
-        # be called on the compiled model execution path.
+        # 首次 Dynamo 跟踪结束后才注册逐层 NVTX 性能标记 hook。如果提前注册，
+        # Dynamo 会把 hook 中的 NVTX 操作也纳入跟踪，可能造成 graph break。
+        # DYNAMO_ONCE/VLLM_COMPILE 在首次跟踪后会让 __call__ 走编译函数，因此
+        # 此时注册既能服务 eager 性能分析，又不会污染已生成的编译图。
         self._register_layerwise_nvtx_hooks()
 
-        # This is necessary to avoid blocking DP.
-        # For dummy runs, we typically skip EPLB since we don't have any real
-        # requests to process.
-        # However, in DP settings, there may be cases when some DP ranks do
-        # not have any requests to process, so they're executing dummy batches.
-        # In such cases, we still have to trigger EPLB to make sure
-        # ranks execute the rearrangement in synchronization.
+        # EPLB 是 Expert Parallel Load Balancing，用于 MoE 专家重排。即使本 rank
+        # 只是执行 dummy batch，其他 DP rank 可能正在处理真实请求；所有 rank
+        # 仍需同步参与重排，否则集体通信会互相等待而死锁。Qwen2 是普通 MLP，
+        # 没有 MoE 专家，eplb_step 会很快返回。
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
+        # 选出每条虚拟请求最后一个 token 的下标。例如各请求 token 数为
+        # [2,2,4]，累计和是 [2,4,8]，减 1 得到 [1,3,7]。
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
+        # 转成模型设备上的索引张量。GPU 可异步复制，CPU 则直接创建 CPU tensor。
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
+        # 第一个返回值包含所有 padded token 的状态，供 pooling/内存画像；
+        # 第二个只包含每请求末 token 状态，profile_run 随后用它预热 lm_head 和
+        # sampler。这里只做索引选择，尚未计算 logits。
         return hidden_states, hidden_states[logit_indices_device]
 
     @torch.inference_mode()
@@ -6157,37 +6221,71 @@ class GPUModelRunner(
         return self._dummy_pooler_run_task(hidden_states, max_task)
 
     def profile_run(self) -> None:
-        # Profile with multimodal encoder & encoder cache.
+        """执行一次覆盖最大调度规模的虚拟前向和虚拟输出处理。
+
+        虽然本方法定义在 ``GPUModelRunner``，CPUModelRunner 也继承并调用它。
+        方法把真实推理的重要路径预先走一遍：可选多模态 encoder、语言模型
+        forward，以及 sampler 或 pooler。所有输入都是 dummy 数据，结果不会
+        返回给 API 用户。
+
+        对当前纯文本 Qwen2-0.5B CPU 服务，实际主路径可以简化成：
+
+        ``_dummy_run(max_num_tokens) -> Qwen2.forward -> _dummy_sampler_run``
+
+        ``max_num_tokens`` 来自调度器的 ``max_num_batched_tokens``，表示一次
+        scheduler step 最多处理多少 token，不等于 ``--max-model-len``。后者是
+        单条序列最大总长度；前者是所有并发请求本轮 token 数之和。使用较大
+        通用批次预热，能提前覆盖接近最大压力的算子、编译和缓冲区需求。
+
+        在 GPUWorker 中，外层 memory_profiling 会观察本方法带来的峰值显存；
+        在当前 CPUWorker 中，本方法先触发持久分配，返回后再读取进程 RSS。
+        因此 ``profile`` 在这里更接近“用代表性负载进行预热/内存画像”，并不
+        意味着本方法自己直接读取或返回内存数字。
+        """
+        # 第一阶段：如果是图文/音视频模型，先覆盖多模态 encoder 和 encoder
+        # cache 的内存峰值。当前 Qwen2-0.5B 是纯文本模型，
+        # supports_mm_inputs=False，所以整段都会跳过。
         if self.supports_mm_inputs:
+            # 取得多模态配置，例如每种模态的数量、最大尺寸和是否跳过画像。
             mm_config = self.model_config.multimodal_config
+            # 用户可明确跳过多模态 encoder 画像，通常用于已经了解内存需求的
+            # 特殊部署；语言模型的虚拟运行仍会继续。
             if mm_config is not None and mm_config.skip_mm_profiling:
                 logger.info(
                     "Skipping memory profiling for multimodal encoder and "
                     "encoder cache."
                 )
             else:
+                # mm_budget 汇总本轮允许的 encoder token 和各模态 item 上限。
                 mm_budget = self.mm_budget
+                # 支持多模态且未跳过时，初始化阶段应该已经创建预算对象。
                 assert mm_budget is not None
 
+                # 海象运算符 := 同时取得 encoder token 预算并保存到变量。
+                # 预算为 0 表示没有 encoder 工作，不需要构造虚拟输入。
                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
+                    # 若每种模态允许的 item 数都为 0，这是“外部已经提供
+                    # embedding”的模式：需要为 embedding 存储留预算，但不会
+                    # 在 vLLM 内执行图片/视频 encoder。
                     if not mm_budget.mm_max_toks_per_item:
-                        # All modality limits are 0 — embedding-only mode.
-                        # Budget is non-zero for embedding storage, but
-                        # there's no encoder to profile.
                         logger.info(
                             "Skipping encoder profiling for embedding-only "
                             "mode (all modality limits=0 with "
                             "enable_mm_embeds=True).",
                         )
                     else:
-                        # NOTE: Currently model is profiled with a single
-                        # non-text modality with the max possible input
-                        # tokens even when it supports multiple.
+                        # 当前画像选择“单个最耗 token 的非文本模态”，即便模型
+                        # 同时支持图片和视频，也不会在此组合全部模态。这样用一个
+                        # 代表性的最大输入覆盖主要 encoder 内存压力。
                         dummy_modality = mm_budget.get_modality_with_max_tokens()
+                        # 取得该模态一次 batch 最多允许多少个 item。例如可能是
+                        # 4 张最大尺寸图片；具体值由模型和命令行限制共同决定。
                         max_mm_items_per_batch = mm_budget.mm_max_items_per_batch[
                             dummy_modality
                         ]
 
+                        # logger.info_once 保证相同信息只打印一次，避免多次预热
+                        # 或多 rank 时日志过度重复。
                         logger.info_once(
                             "Encoder cache will be initialized with a "
                             "budget of %s tokens, and profiled with "
@@ -6197,38 +6295,63 @@ class GPUModelRunner(
                             dummy_modality,
                         )
 
-                        # Create dummy batch of multimodal inputs.
+                        # 创建最大特征尺寸的虚拟图片/视频等输入。内容本身没有语义，
+                        # 只需要形状和 dtype 能走过真实 encoder 路径。
                         batched_dummy_mm_inputs = self._get_mm_dummy_batch(
                             dummy_modality,
                             max_mm_items_per_batch,
                         )
 
-                        # Run multimodal encoder.
+                        # 执行多模态 encoder，得到之后会插入语言模型序列的
+                        # embedding。纯文本 Qwen2 不会执行这里。
                         dummy_encoder_outputs = self.model.embed_multimodal(
                             **batched_dummy_mm_inputs
                         )
 
+                        # 校验 encoder 返回的 item 数和虚拟输入一致，防止画像过程
+                        # 悄悄漏算一部分输出及其内存。
                         sanity_check_mm_encoder_outputs(
                             dummy_encoder_outputs,
                             expected_num_items=max_mm_items_per_batch,
                         )
+                        # 临时放入 encoder_cache，模拟真实请求中 encoder 输出被
+                        # 缓存等待语言模型消费时的内存占用。
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        # 第二阶段：用调度器允许的最大总 token 数执行语言模型 dummy forward。
+        # is_profile=True 会强制 eager 方式执行这一轮的调度包装，并提示底层这是
+        # 画像运行；模型内部 torch.compile 仍可能在首次 __call__ 时被触发。
+        # 该标志也让分布式实现预先创建真实运行可能需要的通信 buffer。
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        # 只有最后一个 PP rank 具有最终隐藏状态和输出头，所以只有它继续模拟
+        # pooler/sampler。中间 PP rank 只负责把中间张量传给下一 rank。
         if get_pp_group().is_last_rank:
+            # Embedding/reranker 等 pooling 模型不预测 token，而把隐藏状态汇聚
+            # 成向量或分数，因此预热 pooler。
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:
+                # 当前 Qwen2 是生成模型：last_hidden_states 是每个虚拟请求最后
+                # 一个调度 token 的隐藏状态。虚拟 sampler 会覆盖 lm_head、
+                # logits 处理和采样所需内存，但不会产生对用户有意义的 token。
                 output = self._dummy_sampler_run(last_hidden_states)
         else:
+            # 非末 PP rank 没有输出处理结果，用 None 表示没有 sampler/pooler。
             output = None
+        # 确保异步设备工作完成后再测峰值或释放临时张量。GPU 会真正 synchronize；
+        # CPUModelRunner 把 _sync_device 覆盖为空操作，因为 CPU 运算已同步完成。
         self._sync_device()
+        # 主动删除体积可能很大的虚拟隐藏状态和输出，避免它们在后续真正分配
+        # KV Cache 时仍占内存。last_hidden_states 是 hidden_states 的选取结果，
+        # 函数结束后也会离开作用域。
         del hidden_states, output
+        # 多模态画像阶段临时塞入的 encoder 输出不属于常驻 cache，预热结束清空。
         self.encoder_cache.clear()
+        # 立即做一次 Python 垃圾回收，尽早释放没有引用的临时对象。编译缓存、
+        # 权重和必要的持久 buffer 仍被引用，因此会保留并计入后续内存基线。
         gc.collect()
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:

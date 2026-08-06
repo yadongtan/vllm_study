@@ -118,10 +118,42 @@ class CPUModelRunner(GPUModelRunner):
 
     @instrument(span_name="Warmup (CPU)")
     def warming_up_model(self) -> None:
+        """用虚拟输入预热 CPU 模型，并触发需要的编译与惰性初始化。
+
+        ``@instrument`` 是可观测性装饰器：如果启用了 tracing，它会把整个函数
+        记录成名为 ``Warmup (CPU)`` 的耗时区间（span），方便分析启动速度；
+        它不是 PyTorch 编译装饰器，也不会改变模型的数学结果。
+
+        这里说的“运行一次模型”并不是生成用户输出。``profile_run`` 会创建
+        dummy token、dummy positions 和虚拟调度元数据，调用与真实请求相同的
+        Qwen2 前向路径，然后丢弃结果。主要目的有两个：
+
+        1. 第一次执行 ``@support_torch_compile`` 模型时，触发 Dynamo 跟踪和
+           CPU Inductor 编译，避免首个用户请求承担这段启动延迟；
+        2. 让编译产物及持久缓冲区真实占用内存，随后
+           ``determine_available_memory`` 才能从 Worker 预算中扣除它们，安全
+           决定 KV Cache 大小。
+
+        若启动参数包含 ``--enforce-eager``，vLLM 会关闭 torch.compile；但
+        ``profile_run`` 仍会执行，用来预热算子和形成真实内存基线。因此在
+        qwen2.py 打断点时，服务器尚未监听 8000 端口就可能先命中一次。
+        """
+        # 记录开始日志。这里的 compilation 是主要目的，但 eager 模式也会
+        # 执行相同预热流程，所以日志文本不会随 --enforce-eager 改变。
         logger.info("Warming up model for the compilation...")
-        # Only generate graph for the generic shape
+        # 临时设置 CPU Inductor 的全局编译选项。当前 context manager 会在
+        # max_autotune=True 时临时开启 freezing，使 MKLDNN/CPPGEMM 能把不变的
+        # 模型参数冻结进优化图；退出 with 后恢复原值，避免污染其他模型/任务。
+        #
+        # 这里只为通用的最大 token 批次形状生成/预热计算路径。真实请求的
+        # num_tokens 可以较小，动态形状配置会尽量复用这份编译结果。
         with _set_global_compilation_settings(self.vllm_config):
+            # CPUModelRunner 继承 GPUModelRunner.profile_run。尽管定义文件名中有
+            # gpu，该方法包含跨设备的通用虚拟前向流程；CPU 的 CUDA Graph、
+            # 设备同步等能力已由 CPUModelRunner 属性或 override 禁用/替换。
             self.profile_run()
+        # 到这里虚拟前向、虚拟 sampler 和临时对象清理均已完成；持久编译产物
+        # 则有意保留，供真实请求复用并计入后续 RSS 内存。
         logger.info("Warming up done.")
 
     def initialize_kv_cache(

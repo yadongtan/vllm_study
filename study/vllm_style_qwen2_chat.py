@@ -22,6 +22,8 @@ Paged KV Cache、
 from collections.abc import Iterator
 # contextmanager 可以把带有 yield 的函数转换为上下文管理器。
 from contextlib import contextmanager
+# Enum 用来为不同类型的 KV Cache 提供明确的键。
+from enum import Enum
 # Path 用面向对象的方式拼接和检查文件路径。
 from pathlib import Path
 
@@ -133,7 +135,7 @@ if __name__ == "__main__":
 
 
 def build_rope(
-    sequence_length: int,
+    positions: torch.Tensor,
     head_dim: int,
     rope_theta: float,
     device: torch.device,
@@ -150,12 +152,6 @@ def build_rope(
     temp = dimensions / head_dim
     temp2 = rope_theta ** temp
     inv_freq = 1.0 / temp2
-    # 生成位置编号 [0, 1, ..., sequence_length-1]。
-    positions = torch.arange(
-        sequence_length,
-        device=device,
-        dtype=torch.float32,
-    )
     # 外积得到 [sequence_length, head_dim/2] 的“位置 x 频率”矩阵。
     frequencies = torch.outer(positions, inv_freq)
     # 复制一次频率，使最后一维恢复为完整 head_dim。
@@ -163,12 +159,21 @@ def build_rope(
     embeddings = torch.cat((frequencies, frequencies), dim=-1)
     # 增加 batch 和 heads 两个广播维。
     # 最终形状为 [1, 1, sequence, head_dim]。
-    shape = (1, 1, sequence_length, head_dim)
+    shape = (1, 1, positions.numel(), head_dim)
     # cos/sin 先以 FP32 计算，再转成模型类型。
     # view 只改变形状，不复制数据。
     return embeddings.cos().to(dtype).view(shape), embeddings.sin().to(dtype).view(
         shape
     )
+
+
+class KVCacheType(Enum):
+    K = 1
+    V = 2
+
+
+# request_id -> cache type -> layer index -> cached tensor。
+KVCacheStore = dict[int, dict[KVCacheType, dict[int, torch.Tensor]]]
 
 
 class Qwen2Attention(nn.Module):
@@ -208,6 +213,10 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        ids: list[int],
+        position_ids: list[int],
+        kv_cache_manager: KVCacheStore,
+        layer_index: int,
     ) -> torch.Tensor:
         """计算一层因果自注意力，输入和输出均为 [B, S, 896]。"""
 
@@ -250,15 +259,50 @@ class Qwen2Attention(nn.Module):
         value = value.repeat_interleave(num_groups, dim=1)
         # PyTorch SDPA 执行缩放点积、因果遮罩、Softmax，
         # 然后把注意力概率与 Value 相乘。
+        if batch_size != 1 or len(ids) != 1 or len(position_ids) != 1:
+            raise NotImplementedError(
+                "This minimal KV cache demo supports batch_size=1"
+            )
+
+        request_cache = kv_cache_manager[ids[0]]
+        start_position = position_ids[0]
+        attention_mask = None
+        if start_position > 0:
+            # Cache 在前、当前 token 在后，保持序列的时间顺序。
+            k_cache = request_cache[KVCacheType.K][layer_index]
+            v_cache = request_cache[KVCacheType.V][layer_index]
+            cache_length = k_cache.shape[2]
+            if cache_length != start_position:
+                raise ValueError(
+                    f"KV cache length {cache_length} does not match "
+                    f"start position {start_position}"
+                )
+            print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
+            key = torch.cat((k_cache, key), dim=2)
+            value = torch.cat((v_cache, value), dim=2)
+            print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
+            # is_causal=True 使用左上对齐的遮罩，不适用于带前缀 Cache 的 Query。
+            # 显式遮罩让当前 chunk 的第 i 个 Query 看见 Cache 和本 chunk 的 0..i。
+            query_positions = torch.arange(sequence_length, device=key.device)
+            key_positions = torch.arange(key.shape[2], device=key.device)
+            attention_mask = key_positions[None, :] <= (
+                cache_length + query_positions[:, None]
+            )
+
+        # 当前层计算完成后，Cache 包含此前前缀和当前 chunk。
+        request_cache[KVCacheType.K][layer_index] = key
+        request_cache[KVCacheType.V][layer_index] = value
         attention = F.scaled_dot_product_attention(
             query,
             key,
             value,
+            attn_mask=attention_mask,
             # 推理阶段不使用 dropout。
             dropout_p=0.0,
             # 因果遮罩保证位置 i 不能看到位置 i 之后的 token。
-            is_causal=True,
+            is_causal=attention_mask is None,
         )
+
         # [B,14,S,64] 先转成 [B,S,14,64]，再合并头得到 [B,S,896]。
         attention = attention.transpose(1, 2).reshape(
             batch_size, sequence_length, self.q_size
@@ -302,7 +346,7 @@ class Qwen2MLP(nn.Module):
 class Qwen2DecoderLayer(nn.Module):
     """一个完整 Qwen2 Decoder 层：Attention + MLP + 两次残差连接。"""
 
-    def __init__(self, config: PretrainedConfig) -> None:
+    def __init__(self, config: PretrainedConfig, layer_index: int) -> None:
         # 初始化模块注册机制。
         super().__init__()
         # 创建本层的 GQA 自注意力子模块。
@@ -319,21 +363,33 @@ class Qwen2DecoderLayer(nn.Module):
             config.hidden_size,
             config.rms_norm_eps,
         )
+        self.layer_index = layer_index
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        ids: list[int],
+        position_ids: list[int],
+        kv_cache_manager: KVCacheStore,
+        query_len: int,
     ) -> torch.Tensor:
         """依次执行归一化、Attention、残差、归一化、MLP、残差。"""
-
         # 保存 Attention 分支的输入，用于第一次残差连接。
         residual = hidden_states
         # Qwen2 使用 Pre-Norm：先归一化，再进入 Attention。
         hidden_states = self.input_layernorm(hidden_states)
         # Attention 输出与未归一化的原输入相加。
-        hidden_states = residual + self.self_attn(hidden_states, cos, sin)
+        hidden_states = residual + self.self_attn(
+            hidden_states,
+            cos,
+            sin,
+            ids,
+            position_ids,
+            kv_cache_manager,
+            self.layer_index,
+        )
 
         # 保存 Attention 残差结果，作为 MLP 分支的残差。
         residual = hidden_states
@@ -357,20 +413,33 @@ class Qwen2Model(nn.Module):
         # ModuleList 会正确注册所有 Decoder 层的参数。
         self.layers = nn.ModuleList(
             # 根据 config.json 创建 num_hidden_layers=24 个独立层。
-            Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)
+            Qwen2DecoderLayer(config, layer_index)
+            for layer_index in range(config.num_hidden_layers)
         )
         # 所有 Decoder 层之后还有一次最终 RMSNorm。
         self.norm = Qwen2RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        ids: list[int],
+        position_ids: list[int],
+        kv_cache_manager: KVCacheStore,
+        query_len: int,
+    ) -> torch.Tensor:
         """把 [B,S] token id 转换为 [B,S,896] 上下文化隐藏状态。"""
 
         # Embedding 查表把整数 token id 变成浮点隐藏向量。
         hidden_states = self.embed_tokens(input_ids)
         # 同一层内所有注意力头共享当前序列的 RoPE cos/sin。
         cos, sin = build_rope(
-            # input_ids 第 1 维就是当前完整序列长度 S。
-            input_ids.shape[1],
+            # 当前输入的序列长度 S，必须与 Query 的序列维一致。
+            torch.arange(
+                position_ids[0],
+                position_ids[0] + query_len,
+                device=input_ids.device,
+                dtype=torch.float32,
+            ),
             # 本模型 head_dim = hidden_size 896 / num_heads 14 = 64。
             self.config.hidden_size // self.config.num_attention_heads,
             # RoPE 基数直接读取 config.json。
@@ -382,7 +451,15 @@ class Qwen2Model(nn.Module):
         )
         # 隐藏状态依次通过 24 层；每层使用相同位置对应的 cos/sin。
         for layer in self.layers:
-            hidden_states = layer(hidden_states, cos, sin)
+            hidden_states = layer(
+                hidden_states,
+                cos,
+                sin,
+                ids,
+                position_ids,
+                kv_cache_manager,
+                query_len,
+            )
         # 返回最终归一化结果；此时还没有计算词表 logits。
         return self.norm(hidden_states)
 
@@ -401,11 +478,24 @@ class Qwen2ForCausalLM(nn.Module):
         # 所有参数目前仍是未加载的初始化值。
         self.model = Qwen2Model(config)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        ids: list[int],
+        position_ids: list[int],
+        kv_cache_manager: KVCacheStore,
+        query_len: int,
+    ) -> torch.Tensor:
         """返回最后一个输入位置对整个词表的未归一化分数。"""
 
         # 主干计算序列中所有 token 的上下文化隐藏状态。
-        hidden_states = self.model(input_ids)
+        hidden_states = self.model(
+            input_ids,
+            ids,
+            position_ids,
+            kv_cache_manager,
+            query_len,
+        )
         # 自回归生成只需要最后位置；形状由 [B,S,896] 变为 [B,896]。
         last_hidden_state = hidden_states[:, -1]
         # 使用 Embedding 矩阵作为 lm_head，输出 [B,vocab_size] logits。
@@ -628,10 +718,54 @@ def generate(
     # generated 只保存新 token，最终解码时不会重复用户提示词。
     generated: list[int] = []
 
+    max_prefill_chunk_tokens = 2000
+    prefill_len = token_ids.shape[1]
+    ids = [1]
+    kv_cache_manager: KVCacheStore = {
+        1: {
+            KVCacheType.K: {},
+            KVCacheType.V: {},
+        }
+    }
     # 最多生成 max_new_tokens 个 token，防止模型一直不输出结束符。
-    for _ in range(max_new_tokens):
+    for decode_index in range(max_new_tokens):
+        print("token_ids.shape: ", token_ids.shape)
         # 模型返回 [B,vocab] logits；argmax 选择分数最高的下一个 token。
-        next_token = model(token_ids).argmax(dim=-1)
+        if decode_index == 0 and prefill_len > max_prefill_chunk_tokens:
+            # 先prefill
+            current_pos = 0
+            while current_pos < prefill_len:
+                right_index = min(
+                    current_pos + max_prefill_chunk_tokens,
+                    prefill_len,
+                )
+                current_token_ids = token_ids[:, current_pos:right_index]
+                logits = model(
+                    current_token_ids,
+                    ids,
+                    [current_pos],
+                    kv_cache_manager,
+                    right_index - current_pos,
+                )
+                current_pos = right_index
+        elif decode_index == 0:
+            logits = model(
+                token_ids,
+                ids,
+                [0],
+                kv_cache_manager,
+                prefill_len,
+            )
+        else:
+            logits = model(
+                token_ids[:, -1:],
+                ids,
+                [prefill_len + decode_index - 1],
+                kv_cache_manager,
+                1,
+            )
+        # 每条请求的 logits 都覆盖整个词表；贪心选择后形状为 [B]。
+        next_token = logits.argmax(dim=-1)
         # 交互 demo 的 batch_size=1。
         # 因此用 item() 取得唯一的 Python 整数。
         next_token_id = next_token.item()

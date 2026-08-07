@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoConfig, AutoTokenizer
 
-from vllm_style_qwen2_chat import (
+from qwen2_demo import (
     KVCacheStore,
     KVCacheType,
     MODEL_PATH,

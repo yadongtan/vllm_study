@@ -171,16 +171,13 @@ class KVCacheType(Enum):
     K = 1
     V = 2
 
-
 # request_id -> cache type -> layer index -> cached tensor。
 KVCacheStore = dict[int, dict[KVCacheType, dict[int, torch.Tensor]]]
-
 
 class Qwen2Attention(nn.Module):
     """带 Grouped Query Attention 和融合 QKV 参数的自注意力层。"""
 
     def __init__(self, config: PretrainedConfig) -> None:
-        # 让 PyTorch 注册下面创建的参数和子模块。
         super().__init__()
         # Query 头数量；Qwen2-0.5B 为 14。
         self.num_heads = config.num_attention_heads
@@ -243,7 +240,6 @@ class Qwen2Attention(nn.Module):
         value = value.view(
             batch_size, sequence_length, self.num_kv_heads, self.head_dim
         ).transpose(1, 2)
-
         # 对 Query 应用 q*cos + rotate_half(q)*sin。
         # 这个操作会把位置信息编码进向量。
         query = query * cos + rotate_half(query) * sin
@@ -263,33 +259,28 @@ class Qwen2Attention(nn.Module):
             raise NotImplementedError(
                 "This minimal KV cache demo supports batch_size=1"
             )
-
         request_cache = kv_cache_manager[ids[0]]
         start_position = position_ids[0]
         attention_mask = None
+        # 非首次prefill则一定有缓存
         if start_position > 0:
-            # Cache 在前、当前 token 在后，保持序列的时间顺序。
             k_cache = request_cache[KVCacheType.K][layer_index]
             v_cache = request_cache[KVCacheType.V][layer_index]
             cache_length = k_cache.shape[2]
-            if cache_length != start_position:
-                raise ValueError(
-                    f"KV cache length {cache_length} does not match "
-                    f"start position {start_position}"
-                )
+            assert cache_length == start_position
             print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
             key = torch.cat((k_cache, key), dim=2)
             value = torch.cat((v_cache, value), dim=2)
             print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
-            # is_causal=True 使用左上对齐的遮罩，不适用于带前缀 Cache 的 Query。
-            # 显式遮罩让当前 chunk 的第 i 个 Query 看见 Cache 和本 chunk 的 0..i。
+            # 重新定义mask矩阵
             query_positions = torch.arange(sequence_length, device=key.device)
             key_positions = torch.arange(key.shape[2], device=key.device)
+
+
             attention_mask = key_positions[None, :] <= (
                 cache_length + query_positions[:, None]
             )
-
-        # 当前层计算完成后，Cache 包含此前前缀和当前 chunk。
+        # 缓存新kv
         request_cache[KVCacheType.K][layer_index] = key
         request_cache[KVCacheType.V][layer_index] = value
         attention = F.scaled_dot_product_attention(
@@ -302,11 +293,13 @@ class Qwen2Attention(nn.Module):
             # 因果遮罩保证位置 i 不能看到位置 i 之后的 token。
             is_causal=attention_mask is None,
         )
-
+        print("q.shape: ", query.shape, ", k.shape: ", key.shape, ", v.shape: ", value.shape)
+        print("attention.shape before: ", attention.shape)
         # [B,14,S,64] 先转成 [B,S,14,64]，再合并头得到 [B,S,896]。
         attention = attention.transpose(1, 2).reshape(
             batch_size, sequence_length, self.q_size
         )
+        print("attention.shape after: ", attention.shape)
         # 输出投影融合各注意力头，返回 [B,S,hidden_size]。
         return self.o_proj(attention)
 

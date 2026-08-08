@@ -26,11 +26,14 @@ from contextlib import contextmanager
 from enum import Enum
 # Path 用面向对象的方式拼接和检查文件路径。
 from pathlib import Path
+import queue
+import threading
 
 # torch 提供张量、设备、数据类型及推理模式等基础能力。
 import torch
 # F 包含无状态算子；这里使用 SiLU、线性投影和 SDPA Attention。
 import torch.nn.functional as F
+from prometheus_client.decorator import append
 # safe_open 可以按名称逐个读取 Safetensors 张量。
 # 这样能够避免一次复制所有权重。
 from safetensors import safe_open
@@ -38,7 +41,7 @@ from safetensors import safe_open
 from torch import nn
 # Transformers 这里只负责配置和分词，不负责创建或加载模型。
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
-
+from vllm.v1.core.kv_cache_manager import KVCacheManager
 
 # __file__ 是当前脚本；parents[1] 是仓库根目录 vllm/。
 # 后面的 / 运算符依次拼出本地 Hugging Face 模型目录。
@@ -48,6 +51,105 @@ MODEL_PATH = (
     / "Qwen"
     / "Qwen2-0.5B-Instruct"
 )
+
+class Request:
+    def __init__(
+        self,
+        input_ids,
+        req_id,
+        max_new_tokens: int = 128,
+        ignore_eos: bool = False,
+    ):
+        self.input_ids = input_ids
+        self.start = 0
+        self.position = 0
+        self.req_id = req_id
+        self.max_new_tokens = max_new_tokens
+        self.ignore_eos = ignore_eos
+        self.decode_tokens: list[torch.Tensor] = []
+        self.prefill_seq_len = input_ids.shape[0]
+        self.already_read_token_idx = 0
+        self.finished = False
+        self.output_condition = threading.Condition()
+
+    def append_decode_token(
+        self,
+        decode_token: torch.Tensor,
+        finished: bool = False,
+    ) -> None:
+        with self.output_condition:
+            self.decode_tokens.append(decode_token)
+            self.start = self.position
+            self.position += 1
+            self.finished = finished
+            self.output_condition.notify_all()
+
+    def wait_for_new_tokens(self) -> tuple[list[int], bool]:
+        """等待网络线程尚未读取的 token，并推进读取索引。"""
+        with self.output_condition:
+            while (
+                self.already_read_token_idx == len(self.decode_tokens)
+                and not self.finished
+            ):
+                self.output_condition.wait()
+
+            start = self.already_read_token_idx
+            end = len(self.decode_tokens)
+            token_ids = [
+                int(token.item())
+                for token in self.decode_tokens[start:end]
+            ]
+            # 只由网络线程推进已经读取到的位置。
+            self.already_read_token_idx = end
+            return token_ids, self.finished
+
+    def get_and_set_next_process(self, max_chunk_prefill_len):
+        # decode请求
+        if self.prefill_seq_len == self.position and len(self.decode_tokens) == 0:
+            print("self.start: ", self.start, "self.position: ", self.position)
+            return 1
+        elif len(self.decode_tokens) > 0:
+            print("self.start: ", self.start, "self.position: ", self.position)
+            return 1
+        # 剩余prefill长度大于分块长度
+        elif self.prefill_seq_len - self.position > max_chunk_prefill_len:
+            self.start = self.position
+            self.position = self.position + max_chunk_prefill_len
+            print("self.start: ", self.start, "self.position: ", self.position)
+            return max_chunk_prefill_len
+        # 剩余prefill长度小于分块长度
+        else:
+            self.start = self.position
+            self.position =  self.prefill_seq_len
+            print("self.start: ", self.start, "self.position: ", self.position)
+            return self.position - self.start
+
+
+    def get_next_process_len(self, max_chunk_prefill_len):
+        # decode请求
+        if self.prefill_seq_len < self.position:
+            return 1
+        # 剩余prefill长度大于分块长度
+        elif self.prefill_seq_len - self.position > max_chunk_prefill_len:
+            return max_chunk_prefill_len
+        # 剩余prefill长度小于分块长度
+        else:
+            return self.prefill_seq_len - self.position
+
+    def update_prefill_len(self):
+        self.start = self.position
+
+    # 返回当前prefill/decode关注的token
+    def get_current_pd_token(self):
+        if self.position <= self.prefill_seq_len:
+            return self.input_ids[self.start:self.position]
+        # decode，直接返回固定的
+        else:
+            return self.decode_tokens[self.position - self.prefill_seq_len - 1]
+
+    def get_current_pd_token_pos(self):
+        return torch.arange(self.start, self.position, dtype=torch.int64)
+
 
 
 def get_device_and_dtype() -> tuple[torch.device, torch.dtype]:
@@ -125,15 +227,6 @@ def rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
-def test():
-    first = torch.tensor([1, 2], dtype=torch.float16)
-    second = torch.tensor([3, 4], dtype=torch.float16)
-    print(torch.cat([-second, first], dim=-1))
-
-if __name__ == "__main__":
-    test()
-
-
 def build_rope(
     positions: torch.Tensor,
     head_dim: int,
@@ -205,13 +298,42 @@ class Qwen2Attention(nn.Module):
         # o_proj 把多头注意力输出从 896 维投影回 hidden_size=896。
         self.o_proj = nn.Linear(self.q_size, config.hidden_size, bias=False)
 
+    def pad_sequences_with_offset(self, tensors):
+        """
+        将多个不同长度的张量填充到相同长度，并在每行中保持相对偏移位置
+
+        Args:
+            tensors: list of torch.Tensor
+
+        Returns:
+            填充后的二维张量
+        """
+        if not tensors:
+            return torch.tensor([])
+
+        # 计算总长度（所有张量长度之和）
+        total_length = sum(len(t) for t in tensors)
+
+        # 创建结果张量
+        result = torch.zeros(len(tensors), total_length)
+
+        # 记录当前偏移位置
+        current_pos = 0
+
+        for i, tensor in enumerate(tensors):
+            # 将当前张量放置在对应位置
+            result[i, current_pos:current_pos + len(tensor)] = tensor
+            current_pos += len(tensor)
+
+        return result
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        ids: list[int],
-        position_ids: list[int],
+        ids: list[Request],
+        query_start_loc: list[int],
         kv_cache_manager: KVCacheStore,
         layer_index: int,
     ) -> torch.Tensor:
@@ -219,8 +341,8 @@ class Qwen2Attention(nn.Module):
 
         # 从输入形状中取出批大小 B 和序列长度 S。
         # 最后一维无需单独保存。
-        batch_size, sequence_length, _ = hidden_states.shape
-        # 一次矩阵乘法产生 [B, S, 1152] 的融合 QKV。
+        sequence_length, _ = hidden_states.shape
+        # 一次矩阵乘法产生 [S, 1152] 的融合 QKV。
         qkv = self.qkv_proj(hidden_states)
         # 按 Q/K/V 的实际宽度把融合结果拆成三个逻辑张量。
         query, key, value = qkv.split(
@@ -228,20 +350,23 @@ class Qwen2Attention(nn.Module):
             dim=-1,
         )
 
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
         # Query 从 [B,S,896] 变成 [B,S,14,64]，再变成 [B,14,S,64]。
         query = query.view(
-            batch_size, sequence_length, self.num_heads, self.head_dim
-        ).transpose(1, 2)
+            sequence_length, self.num_heads, self.head_dim
+        ).transpose(0, 1)
         # Key 从 [B,S,128] 变成 [B,S,2,64]，再变成 [B,2,S,64]。
         key = key.view(
-            batch_size, sequence_length, self.num_kv_heads, self.head_dim
-        ).transpose(1, 2)
+            sequence_length, self.num_kv_heads, self.head_dim
+        ).transpose(0, 1)
         # Value 使用与 Key 相同的 GQA 头数量和形状变换。
         value = value.view(
-            batch_size, sequence_length, self.num_kv_heads, self.head_dim
-        ).transpose(1, 2)
+            sequence_length, self.num_kv_heads, self.head_dim
+        ).transpose(0, 1)
         # 对 Query 应用 q*cos + rotate_half(q)*sin。
         # 这个操作会把位置信息编码进向量。
+
         query = query * cos + rotate_half(query) * sin
         # Key 必须使用相同的旋转位置编码；Value 不使用 RoPE。
         key = key * cos + rotate_half(key) * sin
@@ -250,39 +375,104 @@ class Qwen2Attention(nn.Module):
         # 因此每个 KV 头服务 14/2=7 个 Q 头。
         num_groups = self.num_heads // self.num_kv_heads
         # 为教学上的普通 SDPA 显式复制 Key，使头数从 2 变成 14。
-        key = key.repeat_interleave(num_groups, dim=1)
+        key = key.repeat_interleave(num_groups, dim=0)
         # Value 同样从 [B,2,S,64] 扩展为 [B,14,S,64]。
-        value = value.repeat_interleave(num_groups, dim=1)
+        value = value.repeat_interleave(num_groups, dim=0)
         # PyTorch SDPA 执行缩放点积、因果遮罩、Softmax，
         # 然后把注意力概率与 Value 相乘。
-        if batch_size != 1 or len(ids) != 1 or len(position_ids) != 1:
-            raise NotImplementedError(
-                "This minimal KV cache demo supports batch_size=1"
+        # if batch_size != 1 or len(ids) != 1 or len(query_start_loc) != 1:
+        #     raise NotImplementedError(
+        #         "This minimal KV cache demo supports batch_size=1"
+        #     )
+        batch_attention_mask:list[torch.Tensor] = []
+
+        full_key_chunks: list[torch.Tensor] = []
+        full_value_chunks: list[torch.Tensor] = []
+
+        # 先将当前的输入qkv拆分开，待会再跟缓存合并为一个超大矩阵
+        k_split: list[torch.Tensor] = []
+        v_split: list[torch.Tensor] = []
+
+        # 拆分k_v
+        for request_index in range(len(ids)):
+            query_left = query_start_loc[request_index]
+            query_right = query_start_loc[request_index + 1]
+            k_split.append(key[:, query_left:query_right, :])
+            v_split.append(value[:, query_left:query_right, :])
+
+        for request_index in range(len(ids)):
+            request_cache = kv_cache_manager[ids[request_index].req_id]
+            start_position = ids[request_index].start
+            attention_mask = None
+            # 非首次prefill则一定有缓存
+            if start_position > 0:
+                k_cache = request_cache[KVCacheType.K][layer_index]
+                v_cache = request_cache[KVCacheType.V][layer_index]
+                cache_length = k_cache.shape[1]
+                assert cache_length == start_position
+                print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
+                # key = torch.cat((k_cache, key), dim=1)
+                # value = torch.cat((v_cache, value), dim=1)
+                all_k = torch.cat((k_cache, k_split[request_index]), dim=1)
+                all_v = torch.cat((v_cache, v_split[request_index]), dim=1)
+                full_key_chunks.append(all_k)
+                full_value_chunks.append(all_v)
+
+                print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
+                # 重新定义mask矩阵
+                request_cache[KVCacheType.K][layer_index] = all_k
+                request_cache[KVCacheType.V][layer_index] = all_v
+            else:
+                all_k = k_split[request_index]
+                all_v = v_split[request_index]
+                full_key_chunks.append(all_k)
+                full_value_chunks.append(all_v)
+                request_cache[KVCacheType.K][layer_index] = all_k
+                request_cache[KVCacheType.V][layer_index] = all_v
+
+        key = torch.cat(full_key_chunks, dim=1)
+        value = torch.cat(full_value_chunks, dim=1)
+
+        # mask的形状是[本次全部请求的query长度, 全部请求历史key+本次key的长度]，或者可以理解为query_len(this_time_all) * k_len(all_time_all)
+        # 每个请求应该只能有一个小mask块即 [该请求的本次query长度, 该请求历史key长度 + 本次请求的key的长度]
+        # 每个小块的在mask中的维度都需要进行偏移，以保证只与自己的kv相乘
+        # 比如本次一共6个q（不包含历史），前4个是请求1的，后2两个是请求2的，那么query维度就是0~4是请求1，4~6是请求2
+        # 对k，这两个请求第一个请求上历史key有10个，第二个请求算上历史key一共有20个
+        # 那么在mask的v维度上0~10是请求1的，10～30是请求2
+        # 那么第一个请求的小mask形状就是[4,10],第二个请求的mask形状就是[2,20]
+        # 他们的形状在大mask中就是[0:4, 0:10] = [4,10], [4:6, 10:30] = [2,20]，整个mask.shape=[6,30]
+        attention_mask = torch.zeros(
+            query.shape[1],
+            key.shape[1],
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+
+        # 填充请求自己的因果区域：
+        q_offset = 0
+        k_offset = 0
+        # 需要知道每个q的位置
+        for request_index in range(len(ids)):
+            query_left = query_start_loc[request_index]
+            query_right = query_start_loc[request_index + 1]
+            query_len = query_right - query_left
+            k_len = full_key_chunks[request_index].shape[1]
+
+            past_len = k_len - query_len
+            query_positions = torch.arange(query_len, device=hidden_states.device)
+            # [0, 1, 2, ..., query_len-1]
+            key_positions = torch.arange(k_len, device=hidden_states.device)
+            # [0, 1, 2, ..., k_len-1]
+            # mask
+            local_mask = key_positions[None, :] <= (
+                    past_len + query_positions[:, None]
             )
-        request_cache = kv_cache_manager[ids[0]]
-        start_position = position_ids[0]
-        attention_mask = None
-        # 非首次prefill则一定有缓存
-        if start_position > 0:
-            k_cache = request_cache[KVCacheType.K][layer_index]
-            v_cache = request_cache[KVCacheType.V][layer_index]
-            cache_length = k_cache.shape[2]
-            assert cache_length == start_position
-            print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
-            key = torch.cat((k_cache, key), dim=2)
-            value = torch.cat((v_cache, value), dim=2)
-            print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
-            # 重新定义mask矩阵
-            query_positions = torch.arange(sequence_length, device=key.device)
-            key_positions = torch.arange(key.shape[2], device=key.device)
+            attention_mask[q_offset:q_offset+query_len, k_offset:k_offset + k_len] = local_mask
+            q_offset += query_len
+            k_offset += k_len
 
 
-            attention_mask = key_positions[None, :] <= (
-                cache_length + query_positions[:, None]
-            )
-        # 缓存新kv
-        request_cache[KVCacheType.K][layer_index] = key
-        request_cache[KVCacheType.V][layer_index] = value
+        # key,value已经还原，query可能是batch，需要mask重新拼接
         attention = F.scaled_dot_product_attention(
             query,
             key,
@@ -295,9 +485,9 @@ class Qwen2Attention(nn.Module):
         )
         print("q.shape: ", query.shape, ", k.shape: ", key.shape, ", v.shape: ", value.shape)
         print("attention.shape before: ", attention.shape)
-        # [B,14,S,64] 先转成 [B,S,14,64]，再合并头得到 [B,S,896]。
-        attention = attention.transpose(1, 2).reshape(
-            batch_size, sequence_length, self.q_size
+        # [14,S,64] 先转成 [S,14,64]，再合并头得到 [S,896]。
+        attention = attention.transpose(0, 1).reshape(
+            sequence_length, self.q_size
         )
         print("attention.shape after: ", attention.shape)
         # 输出投影融合各注意力头，返回 [B,S,hidden_size]。
@@ -363,10 +553,9 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        ids: list[int],
-        position_ids: list[int],
+        ids: list[Request],
+        query_start_loc: list[int],
         kv_cache_manager: KVCacheStore,
-        query_len: int,
     ) -> torch.Tensor:
         """依次执行归一化、Attention、残差、归一化、MLP、残差。"""
         # 保存 Attention 分支的输入，用于第一次残差连接。
@@ -379,7 +568,7 @@ class Qwen2DecoderLayer(nn.Module):
             cos,
             sin,
             ids,
-            position_ids,
+            query_start_loc,
             kv_cache_manager,
             self.layer_index,
         )
@@ -415,24 +604,25 @@ class Qwen2Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        ids: list[int],
-        position_ids: list[int],
+        ids: list[Request],
+        query_start_loc: list[int],
         kv_cache_manager: KVCacheStore,
-        query_len: int,
     ) -> torch.Tensor:
         """把 [B,S] token id 转换为 [B,S,896] 上下文化隐藏状态。"""
 
         # Embedding 查表把整数 token id 变成浮点隐藏向量。
         hidden_states = self.embed_tokens(input_ids)
         # 同一层内所有注意力头共享当前序列的 RoPE cos/sin。
+        # 构建同纬度的cos, sin =>   [batch, ...]
+        # [0, 22, 44]
+        #
+        # [0,1,2,3,4,5,...,21,0,1,2,3,4,...,21]
+        position_chunks: list[torch.Tensor] = []
+        for req in ids:
+            position_chunks.append(req.get_current_pd_token_pos().to(device=input_ids.device,dtype=torch.float32))
+        rope_pos_index = torch.cat(position_chunks, dim=0)
         cos, sin = build_rope(
-            # 当前输入的序列长度 S，必须与 Query 的序列维一致。
-            torch.arange(
-                position_ids[0],
-                position_ids[0] + query_len,
-                device=input_ids.device,
-                dtype=torch.float32,
-            ),
+            rope_pos_index,
             # 本模型 head_dim = hidden_size 896 / num_heads 14 = 64。
             self.config.hidden_size // self.config.num_attention_heads,
             # RoPE 基数直接读取 config.json。
@@ -449,9 +639,8 @@ class Qwen2Model(nn.Module):
                 cos,
                 sin,
                 ids,
-                position_ids,
+                query_start_loc,
                 kv_cache_manager,
-                query_len,
             )
         # 返回最终归一化结果；此时还没有计算词表 logits。
         return self.norm(hidden_states)
@@ -474,10 +663,9 @@ class Qwen2ForCausalLM(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        ids: list[int],
-        position_ids: list[int],
+        ids: list[Request],
+        query_start_loc: list[int],
         kv_cache_manager: KVCacheStore,
-        query_len: int,
     ) -> torch.Tensor:
         """返回最后一个输入位置对整个词表的未归一化分数。"""
 
@@ -485,12 +673,25 @@ class Qwen2ForCausalLM(nn.Module):
         hidden_states = self.model(
             input_ids,
             ids,
-            position_ids,
+            query_start_loc,
             kv_cache_manager,
-            query_len,
         )
         # 自回归生成只需要最后位置；形状由 [B,S,896] 变为 [B,896]。
-        last_hidden_state = hidden_states[:, -1]
+        last_indices = torch.tensor(
+            [
+                query_start_loc[i + 1] - 1
+                for i in range(len(ids))
+            ],
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+
+        last_hidden_state = hidden_states.index_select(
+            0,
+            last_indices,
+        )
+
+
         # 使用 Embedding 矩阵作为 lm_head，输出 [B,vocab_size] logits。
         return F.linear(last_hidden_state, self.model.embed_tokens.weight)
 
@@ -696,84 +897,223 @@ class VllmStyleWeightLoader:
         )
 
 
-# inference_mode 比 no_grad 更彻底地关闭 autograd，适合纯推理函数。
-@torch.inference_mode()
-def generate(
-    model: Qwen2ForCausalLM,
-    input_ids: torch.Tensor,
-    eos_token_ids: set[int],
-    max_new_tokens: int = 128,
-) -> list[int]:
-    """使用最小贪心解码；真正 vLLM 会使用 KV Cache 和调度器。"""
 
-    # token_ids 保存“原始提示词 + 已生成 token”的完整序列。
-    token_ids = input_ids
-    # generated 只保存新 token，最终解码时不会重复用户提示词。
-    generated: list[int] = []
 
-    max_prefill_chunk_tokens = 2000
-    prefill_len = token_ids.shape[1]
-    ids = [1]
-    kv_cache_manager: KVCacheStore = {
-        1: {
-            KVCacheType.K: {},
-            KVCacheType.V: {},
-        }
-    }
-    # 最多生成 max_new_tokens 个 token，防止模型一直不输出结束符。
-    for decode_index in range(max_new_tokens):
-        print("token_ids.shape: ", token_ids.shape)
-        # 模型返回 [B,vocab] logits；argmax 选择分数最高的下一个 token。
-        if decode_index == 0 and prefill_len > max_prefill_chunk_tokens:
-            # 先prefill
-            current_pos = 0
-            while current_pos < prefill_len:
-                right_index = min(
-                    current_pos + max_prefill_chunk_tokens,
-                    prefill_len,
+class Scheduler:
+    def __init__(self, eos_token_ids: set[int], model: Qwen2ForCausalLM) -> None:
+        self.running_list: list[Request] = []  # req_id
+        self.waiting_list:list[Request] = []
+        self.finished_list: list[Request] = []
+        self.max_num_seqs = 4
+        # 最大单次batch处理长度
+        self.max_batch_num_tokens = 4000
+        # 分批prefill长度
+        self.chunk_prefill_tokens = 4000
+        self.kv_cache_manager: KVCacheStore = {}
+        self.eos_token_ids: set[int] = eos_token_ids
+        self.max_new_tokens = 128
+        self.model: Qwen2ForCausalLM = model
+        self.incoming_requests: queue.Queue[Request] = queue.Queue()
+        self.wakeup_event = threading.Event()
+        self.stop_event = threading.Event()
+
+        self.worker_thread = threading.Thread(target=self.start_scheduler, daemon=True)
+        self.worker_thread.start()
+
+    def add_request(self, request: Request) -> Request:
+        self.incoming_requests.put(request)
+        self.wakeup_event.set()
+        return request
+
+    def start_scheduler(self):
+        while not self.stop_event.is_set():
+            self._drain_incoming_requests()
+            if not self.running_list and not self.waiting_list:
+                self.wakeup_event.wait()
+                self.wakeup_event.clear()
+                continue
+            self.step()
+
+    def _drain_incoming_requests(self) -> None:
+        """把网络线程提交的请求转入 Scheduler 私有 waiting_list。"""
+        while True:
+            try:
+                self.waiting_list.append(self.incoming_requests.get_nowait())
+            except queue.Empty:
+                return
+
+    # inference_mode 比 no_grad 更彻底地关闭 autograd，适合纯推理函数。
+    @torch.inference_mode()
+    def step(
+        self,
+    ) -> list[list[int]]:
+        if len(self.running_list) != 0 or len(self.waiting_list) != 0:
+            # 先看还有没有空闲位置
+            running_total_tokens = 0
+            for running_req in self.running_list:
+                # running_req_list 可能经过一轮model计算后，需要重新计算这一批次需要处理多少个token
+                # 还需要继续处理请求
+                next_precessor_len = running_req.get_next_process_len(self.chunk_prefill_tokens)
+                next_batch_num_token = running_total_tokens + next_precessor_len
+                # 没有更多空间了
+                if next_batch_num_token > self.max_batch_num_tokens:
+                    next_batch_num_token = (
+                        self.max_batch_num_tokens - running_total_tokens
+                    )
+                    running_req.get_and_set_next_process(next_batch_num_token)
+                    running_total_tokens += next_batch_num_token
+                else:
+                    tokens = running_req.get_and_set_next_process(
+                        self.chunk_prefill_tokens
+                    )
+                    running_total_tokens += tokens
+
+            # 还有空闲再处理waiting队列
+            while (len(self.running_list) < self.max_num_seqs
+                    and len(self.waiting_list) > 0
+                    and self.max_batch_num_tokens > running_total_tokens):
+                # 放请求到running队列
+                # 计算能放多少个token进去，从waiting先取一个出来
+                wait_req_head = self.waiting_list[0]
+                # 先看需要添加多少个token
+                # 看剩余空间
+                left_token_len = self.max_batch_num_tokens - running_total_tokens
+                next_process_len = wait_req_head.get_and_set_next_process(
+                    left_token_len
+                    if left_token_len < self.chunk_prefill_tokens
+                    else self.chunk_prefill_tokens
                 )
-                current_token_ids = token_ids[:, current_pos:right_index]
-                logits = model(
-                    current_token_ids,
-                    ids,
-                    [current_pos],
-                    kv_cache_manager,
-                    right_index - current_pos,
-                )
-                current_pos = right_index
-        elif decode_index == 0:
-            logits = model(
-                token_ids,
-                ids,
-                [0],
-                kv_cache_manager,
-                prefill_len,
-            )
-        else:
-            logits = model(
-                token_ids[:, -1:],
-                ids,
-                [prefill_len + decode_index - 1],
-                kv_cache_manager,
-                1,
-            )
-        # 每条请求的 logits 都覆盖整个词表；贪心选择后形状为 [B]。
-        next_token = logits.argmax(dim=-1)
-        # 交互 demo 的 batch_size=1。
-        # 因此用 item() 取得唯一的 Python 整数。
-        next_token_id = next_token.item()
-        # 遇到 <|im_end|> 或 pad/endoftext 时结束。
-        # 不把这个特殊 token 加入正文。
-        if next_token_id in eos_token_ids:
-            break
-        # 保存新生成的普通 token id。
-        generated.append(next_token_id)
-        # 把 [B] 变成 [B,1] 后追加到序列尾部，供下一轮预测使用。
-        token_ids = torch.cat((token_ids, next_token[:, None]), dim=1)
+                self.running_list.append(wait_req_head)
+                self.waiting_list.remove(wait_req_head)
+                running_total_tokens += next_process_len
 
-    # 返回纯新增 token，交给 tokenizer.decode 转成字符串。
-    return generated
 
+            # 申请kvcache
+            for req in self.running_list:
+                # 每一个请求的开始位置
+                if self.kv_cache_manager.get(req.req_id) is None:
+                    self.kv_cache_manager[req.req_id] = {
+                        KVCacheType.K: {},
+                        KVCacheType.V: {},
+                    }
+
+            # 模拟model
+            for running_req in self.running_list:
+                # 记录处理前状态
+                print("before forward req[", running_req.req_id, "], prefill_len: ", running_req.prefill_seq_len, ", start: ", running_req.start, ", position: ", running_req.position, ", decode_list: ", running_req.decode_tokens)
+                # 是prefill
+            # shape = [batch, 1]
+            next_token_list = self.batch_prefill_and_decode()
+            for i in range(0, len(next_token_list)):
+                running_req = self.running_list[i]
+                next_token = next_token_list[i]
+                if running_req.prefill_seq_len > running_req.position:
+                    running_req.update_prefill_len()
+                    continue
+                if running_req.prefill_seq_len <= running_req.position:
+                    token_count_after_append = (
+                        len(running_req.decode_tokens) + 1
+                    )
+                    finished = (
+                        (
+                            next_token in self.eos_token_ids
+                            and not running_req.ignore_eos
+                        )
+                        or token_count_after_append
+                        >= running_req.max_new_tokens
+                    )
+                    running_req.append_decode_token(
+                        torch.tensor(
+                            [next_token],
+                            device=running_req.input_ids.device,
+                            dtype=running_req.input_ids.dtype,
+                        ),
+                        finished=finished,
+                    )
+            # 记录处理后状态
+            for running_req in self.running_list:
+                print("after forward req[", running_req.req_id, "], prefill_len: ", running_req.prefill_seq_len,
+                    ", start: ", running_req.start, ", position: ", running_req.position, ", decode_list: ",
+                    running_req.decode_tokens)
+            # 重新管理调度队列
+            new_running_req: list[Request] = []
+            for running_req in self.running_list:
+                if running_req.finished:
+                    self.finished_list.append(running_req)
+                else:
+                    new_running_req.append(running_req)
+            self.running_list = new_running_req
+            print("waiting_list.len: ", len(self.waiting_list), " running_list.len: ", len(self.running_list), " finished_list.len: ", len(self.finished_list))
+            if len(self.waiting_list) == 2 and len(self.running_list) == 1 and len(self.finished_list) == 2:
+                print("checkpoint")
+
+    # inference_mode 比 no_grad 更彻底地关闭 autograd，适合纯推理函数。
+    @torch.inference_mode()
+    def batch_prefill_and_decode(
+            self,
+    ) -> list[int]:
+        # 扁平化处理
+        # [1, 2, 3, 4, 20, 30, 99]
+        # [[1,2,3,4], [20, 30], [99]]
+        # [0,4,6,7]
+        # 表示(0, 4)一组，(4, 6)一组,(6,7)一组，这些是q的token
+        # 生成这样的两个张量
+        query_start_loc: list[int] = [0]
+        input_id_chunks: list[torch.Tensor] = []
+        for running_req in self.running_list:
+            input_id_chunks.append(running_req.get_current_pd_token())
+            query_start_loc.append(
+                query_start_loc[-1] + running_req.get_current_pd_token().shape[0]
+            )
+        input_ids =  torch.cat(input_id_chunks, dim=0)
+        print("[batch_prefill_and_decode] input_ids.shape: ", input_ids.shape)
+        print("[batch_prefill_and_decode] query_start_loc: ", query_start_loc)
+        # logits = model(
+        #     input_ids,
+        #     ids,
+        #     query_start_loc,
+        #     kv_cache_manager,
+        # )
+
+        # [batch, logits]
+        batch_logits = self.model(
+            input_ids=input_ids,
+            ids=self.running_list,
+            query_start_loc=query_start_loc,
+            kv_cache_manager=self.kv_cache_manager,
+        )
+        generated: list[int] = []
+        for index in range(batch_logits.shape[0]):
+            # 取当前请求 logits 最大的 5 个候选 token。
+            logit = batch_logits[index]
+            top_k = min(10, logit.shape[-1])
+            top_k_logits, top_k_token_ids = torch.topk(
+                logit,
+                k=top_k,
+                dim=-1,
+            )
+
+            # 只在 Top-5 候选中归一化概率，避免从整个词表随机抽样。
+            top_k_probs = F.softmax(top_k_logits, dim=-1)
+
+            # 按 Top-5 概率分布随机选择一个候选 token。
+            sampled_index = torch.multinomial(
+                top_k_probs,
+                num_samples=1,
+            )
+            next_token_id = int(
+                top_k_token_ids[sampled_index].item()
+            )
+            # 遇到 <|im_end|> 或 pad/endoftext 时结束。
+            # 不把这个特殊 token 加入正文。
+            # if next_token_id in eos_token_ids:
+            #     break
+            # 保存新生成的普通 token id。
+            generated.append(next_token_id)
+        return generated
+
+
+import threading
 
 def main() -> None:
     """加载本地模型并启动 input() 驱动的多轮对话。"""
@@ -813,8 +1153,9 @@ def main() -> None:
     # Qwen2 使用 im_end 结束回答。
     # 同时把 pad/endoftext 也视作停止标记。
     eos_token_ids = {tokenizer.eos_token_id, tokenizer.pad_token_id}
-
+    scheduler = Scheduler(eos_token_ids, model)
     # 不断读取用户输入，直到显式退出、Ctrl+C 或输入流结束。
+    req_id = 10000
     while True:
         try:
             # input 阻塞等待一行文本；strip 去除首尾空白。
@@ -844,16 +1185,33 @@ def main() -> None:
             add_generation_prompt=True,
         )
         # 文本编码为 [1,S] token id，并移动到模型所在设备。
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-        # 调用自定义生成循环。
-        # 这里完全没有使用 Transformers model.generate。
-        generated_ids = generate(model, input_ids, eos_token_ids)
-        # 只解码新增 token，并跳过 ChatML 特殊标记。
-        response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-        # 把最终回答显示给用户。
+        input_ids = tokenizer(
+            prompt,
+            return_tensors="pt",
+        ).input_ids[0].to(device)
+
+        # 提交后，Scheduler 后台线程继续计算；当前线程消费该请求的增量输出。
+        request = Request(input_ids=input_ids, req_id=req_id)
+        request_handle = scheduler.add_request(request)
+
+        generated_ids: list[int] = []
+        while True:
+            token_ids, finished = request_handle.wait_for_new_tokens()
+            generated_ids.extend(token_ids)
+
+            if finished:
+                break
+
+        # 直接交互模式等待请求完全结束后一次性输出。
+        response = tokenizer.decode(
+            generated_ids,
+            skip_special_tokens=True,
+        ).strip()
         print(f"Assistant: {response}")
-        # 保存助手回答，使下一轮问题能够引用本轮上下文。
-        messages.append({"role": "assistant", "content": response})
+        messages.append(
+            {"role": "assistant", "content": response}
+        )
+        req_id += 1
 
 
 # 只有直接执行本文件时才启动交互。

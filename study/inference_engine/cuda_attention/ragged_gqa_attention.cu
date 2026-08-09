@@ -58,7 +58,7 @@ __global__ void ragged_gqa_attention_kernel(
   // 请求很多时可以进一步优化为预先生成 token_to_request 映射。
   int64_t request = 0;
   while (request + 1 < num_requests &&
-         q_token >= query_start_loc[request + 1]) {
+         q_token >= query_start_loc[request + 1]) {  // 8 [0,5,6,10]
     ++request;
   }
   // 当前 token 在所属请求内部的局部位置。若请求的 packed 区间从 10

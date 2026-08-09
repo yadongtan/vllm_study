@@ -26,9 +26,12 @@ def _load_extension() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("study CUDA attention requires a CUDA device")
     root = Path(__file__).resolve().parent
+    build_directory = root / "build"
+    build_directory.mkdir(exist_ok=True)
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
     load(
         name="study_cuda_attention",
+        build_directory=str(build_directory),
         sources=[str(root / "binding.cpp"), str(root / "ragged_gqa_attention.cu")],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],

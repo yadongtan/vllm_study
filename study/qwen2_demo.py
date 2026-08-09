@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from enum import Enum
 # Path 用面向对象的方式拼接和检查文件路径。
 from pathlib import Path
+import os
 import queue
 import threading
 import traceback
@@ -52,10 +53,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheManager
 # __file__ 是当前脚本；parents[1] 是仓库根目录 vllm/。
 # 后面的 / 运算符依次拼出本地 Hugging Face 模型目录。
 MODEL_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "models"
-    / "Qwen"
-    / "Qwen2-0.5B-Instruct"
+    Path(os.environ.get("STUDY_MODEL_PATH", "/opt/models/Qwen2-0.5B-Instruct"))
 )
 
 
@@ -485,17 +483,59 @@ class Qwen2Attention(nn.Module):
                 kv_lens_tensor,
             )
         ).cumsum(0)
-        attention = ragged_gqa_attention(
-            query,
-            key,
-            value,
-            query_start,
-            kv_start,
-            past_lens_tensor,
-            q_lens_tensor,
-            int(kv_lens_tensor.max().item()),
-            self.head_dim**-0.5,
-        )
+        scale = self.head_dim**-0.5
+        if os.environ.get("STUDY_USE_CUDA_ATTENTION", "1") == "0":
+            dense_key = key.repeat_interleave(
+                self.num_heads // self.num_kv_heads, dim=0
+            )
+            dense_value = value.repeat_interleave(
+                self.num_heads // self.num_kv_heads, dim=0
+            )
+            attention_mask = torch.zeros(
+                query.shape[1], key.shape[1], dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            q_offset = 0
+            k_offset = 0
+            for request_index in range(len(ids)):
+                query_len = q_lens[request_index]
+                kv_len = int(kv_lens_tensor[request_index].item())
+                query_positions = torch.arange(
+                    query_len, device=hidden_states.device
+                )
+                key_positions = torch.arange(
+                    kv_len, device=hidden_states.device
+                )
+                local_mask = key_positions[None, :] <= (
+                    past_lens[request_index] + query_positions[:, None]
+                )
+                attention_mask[
+                    q_offset:q_offset + query_len,
+                    k_offset:k_offset + kv_len,
+                ] = local_mask
+                q_offset += query_len
+                k_offset += kv_len
+            attention = F.scaled_dot_product_attention(
+                query,
+                dense_key,
+                dense_value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=scale,
+            )
+        else:
+            attention = ragged_gqa_attention(
+                query, key, value, query_start, kv_start,
+                past_lens_tensor, q_lens_tensor,
+                int(kv_lens_tensor.max().item()), scale,
+            )
+        if os.environ.get("STUDY_DEBUG_FINITE") == "1" and not torch.isfinite(
+            attention
+        ).all():
+            raise FloatingPointError(
+                f"non-finite attention output at layer {layer_index}"
+            )
 
         return self.o_proj(
             attention.transpose(0, 1).reshape(sequence_length, self.q_size)

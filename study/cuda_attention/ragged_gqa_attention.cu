@@ -41,28 +41,63 @@ __global__ void ragged_gqa_attention_kernel(
   const int64_t q_base = (q_head * total_q_tokens + q_token) * head_dim;
   const int64_t kv_stride = total_kv_tokens * head_dim;
 
-  extern __shared__ float scores[];
-  if (tid == 0) {
-    float max_score = -INFINITY;
-    for (int64_t k = 0; k < visible_len; ++k) {
-      const int64_t k_base = kv_head * kv_stride + (kv_begin + k) * head_dim;
-      float dot = 0.0f;
-      for (int64_t d = 0; d < head_dim; ++d) {
-        dot += static_cast<float>(query[q_base + d]) *
-               static_cast<float>(key[k_base + d]);
-      }
-      scores[k] = dot * scale;
-      max_score = fmaxf(max_score, scores[k]);
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* reduction = scores + visible_len;
+  __shared__ float max_score_shared;
+
+  // QK^T: one block owns one query/head. Threads split head_dim and reduce
+  // their partial dot products into one score for each visible key token.
+  for (int64_t k = 0; k < visible_len; ++k) {
+    const int64_t k_base = kv_head * kv_stride + (kv_begin + k) * head_dim;
+    float partial = 0.0f;
+    for (int64_t d = tid; d < head_dim; d += blockDim.x) {
+      partial += static_cast<float>(query[q_base + d]) *
+                 static_cast<float>(key[k_base + d]);
     }
-    float denom = 0.0f;
-    for (int64_t k = 0; k < visible_len; ++k) {
-      scores[k] = expf(scores[k] - max_score);
-      denom += scores[k];
+    reduction[tid] = partial;
+    __syncthreads();
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+      if (tid < offset) reduction[tid] += reduction[tid + offset];
+      __syncthreads();
     }
-    scores[visible_len] = denom;
+    if (tid == 0) scores[k] = reduction[0] * scale;
+    __syncthreads();
+  }
+
+  // Softmax is still the original max-subtract, exp, sum and normalize
+  // formula. Threads parallelize over the key-token dimension.
+  float local_max = -INFINITY;
+  for (int64_t k = tid; k < visible_len; k += blockDim.x) {
+    local_max = fmaxf(local_max, scores[k]);
+  }
+  reduction[tid] = local_max;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (tid < offset) {
+      reduction[tid] = fmaxf(reduction[tid], reduction[tid + offset]);
+    }
+    __syncthreads();
+  }
+  if (tid == 0) max_score_shared = reduction[0];
+  __syncthreads();
+  const float max_score = max_score_shared;
+  float local_sum = 0.0f;
+  for (int64_t k = tid; k < visible_len; k += blockDim.x) {
+    scores[k] = expf(scores[k] - max_score);
+    local_sum += scores[k];
+  }
+  reduction[tid] = local_sum;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset /= 2) {
+    if (tid < offset) reduction[tid] += reduction[tid + offset];
+    __syncthreads();
   }
   __syncthreads();
-  const float denom = scores[visible_len];
+  const float denom = reduction[0];
+
+  // P*V: threads split output head_dim; each thread accumulates its own
+  // output dimensions across all visible value tokens.
   for (int64_t d = tid; d < head_dim; d += blockDim.x) {
     float acc = 0.0f;
     for (int64_t k = 0; k < visible_len; ++k) {
@@ -114,13 +149,13 @@ torch::Tensor ragged_gqa_attention_cuda(
   if (total_q_tokens == 0 || num_requests == 0) return output;
   TORCH_CHECK(max_kv_len > 0 && max_kv_len <= total_kv_tokens,
               "max_kv_len must be within the packed KV length");
-  TORCH_CHECK(total_kv_tokens + 1 <= 16384,
-              "naive CUDA attention supports at most 16383 packed KV tokens");
+  TORCH_CHECK(max_kv_len <= 8192,
+              "parallel CUDA attention supports at most 8192 KV tokens");
   const c10::cuda::CUDAGuard device_guard(query.device());
   const auto stream = at::cuda::getCurrentCUDAStream(query.device().index());
   const dim3 grid(total_q_tokens, query.size(0), 1);
   constexpr int threads = 128;
-  const size_t shared_bytes = static_cast<size_t>(max_kv_len + 1) *
+  const size_t shared_bytes = static_cast<size_t>(max_kv_len + threads) *
                               sizeof(float);
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(),

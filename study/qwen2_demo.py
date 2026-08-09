@@ -28,6 +28,7 @@ from enum import Enum
 from pathlib import Path
 import queue
 import threading
+import traceback
 
 # torch 提供张量、设备、数据类型及推理模式等基础能力。
 import torch
@@ -52,6 +53,26 @@ MODEL_PATH = (
     / "Qwen2-0.5B-Instruct"
 )
 
+
+def get_rope_theta(config: PretrainedConfig) -> float:
+    """Read RoPE theta across Transformers configuration versions."""
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is not None:
+        return float(rope_theta)
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        rope_theta = rope_parameters.get("rope_theta")
+        if rope_theta is not None:
+            return float(rope_theta)
+
+    config_dict = config.to_dict()
+    rope_theta = config_dict.get("rope_theta")
+    if rope_theta is not None:
+        return float(rope_theta)
+
+    raise AttributeError("Qwen2 configuration does not define rope_theta")
+
 class Request:
     def __init__(
         self,
@@ -70,7 +91,15 @@ class Request:
         self.prefill_seq_len = input_ids.shape[0]
         self.already_read_token_idx = 0
         self.finished = False
+        self.error: BaseException | None = None
         self.output_condition = threading.Condition()
+
+    def fail(self, error: BaseException) -> None:
+        """Wake the client and propagate an exception from the scheduler."""
+        with self.output_condition:
+            self.error = error
+            self.finished = True
+            self.output_condition.notify_all()
 
     def append_decode_token(
         self,
@@ -92,6 +121,11 @@ class Request:
                 and not self.finished
             ):
                 self.output_condition.wait()
+
+            if self.error is not None:
+                raise RuntimeError(
+                    "Scheduler failed during inference"
+                ) from self.error
 
             start = self.already_read_token_idx
             end = len(self.decode_tokens)
@@ -410,7 +444,7 @@ class Qwen2Attention(nn.Module):
                 v_cache = request_cache[KVCacheType.V][layer_index]
                 cache_length = k_cache.shape[1]
                 assert cache_length == start_position
-                print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
+                # print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
                 # key = torch.cat((k_cache, key), dim=1)
                 # value = torch.cat((v_cache, value), dim=1)
                 all_k = torch.cat((k_cache, k_split[request_index]), dim=1)
@@ -418,7 +452,7 @@ class Qwen2Attention(nn.Module):
                 full_key_chunks.append(all_k)
                 full_value_chunks.append(all_v)
 
-                print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
+                # print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
                 # 重新定义mask矩阵
                 request_cache[KVCacheType.K][layer_index] = all_k
                 request_cache[KVCacheType.V][layer_index] = all_v
@@ -626,7 +660,7 @@ class Qwen2Model(nn.Module):
             # 本模型 head_dim = hidden_size 896 / num_heads 14 = 64。
             self.config.hidden_size // self.config.num_attention_heads,
             # RoPE 基数直接读取 config.json。
-            self.config.rope_theta,
+            get_rope_theta(self.config),
             # 在输入所在设备直接创建位置张量，避免跨设备复制。
             input_ids.device,
             # cos/sin 使用与隐藏状态一致的 FP16/BF16/FP32 类型。
@@ -904,11 +938,14 @@ class Scheduler:
         self.running_list: list[Request] = []  # req_id
         self.waiting_list:list[Request] = []
         self.finished_list: list[Request] = []
-        self.max_num_seqs = 4
+        # Match vLLM's configured scheduler sequence limit for this test.
+        self.max_num_seqs = 32
         # 最大单次batch处理长度
-        self.max_batch_num_tokens = 4000
+        # vLLM's current default max_num_batched_tokens is 2048.
+        self.max_batch_num_tokens = 2048
         # 分批prefill长度
-        self.chunk_prefill_tokens = 4000
+        # vLLM chunks prefill using the remaining batched-token budget.
+        self.chunk_prefill_tokens = self.max_batch_num_tokens
         self.kv_cache_manager: KVCacheStore = {}
         self.eos_token_ids: set[int] = eos_token_ids
         self.max_new_tokens = 128
@@ -926,13 +963,24 @@ class Scheduler:
         return request
 
     def start_scheduler(self):
-        while not self.stop_event.is_set():
-            self._drain_incoming_requests()
-            if not self.running_list and not self.waiting_list:
-                self.wakeup_event.wait()
-                self.wakeup_event.clear()
-                continue
-            self.step()
+        try:
+            while not self.stop_event.is_set():
+                self._drain_incoming_requests()
+                if not self.running_list and not self.waiting_list:
+                    self.wakeup_event.wait()
+                    self.wakeup_event.clear()
+                    continue
+                self.step()
+        except BaseException as error:
+            traceback.print_exc()
+            self.stop_event.set()
+            pending_requests = (
+                self.running_list
+                + self.waiting_list
+                + list(self.incoming_requests.queue)
+            )
+            for request in pending_requests:
+                request.fail(error)
 
     def _drain_incoming_requests(self) -> None:
         """把网络线程提交的请求转入 Scheduler 私有 waiting_list。"""
@@ -1039,6 +1087,10 @@ class Scheduler:
             new_running_req: list[Request] = []
             for running_req in self.running_list:
                 if running_req.finished:
+                    # The request will never use its per-layer K/V tensors
+                    # again. Drop the entry immediately so CUDA memory can be
+                    # reused by subsequent requests.
+                    self.kv_cache_manager.pop(running_req.req_id, None)
                     self.finished_list.append(running_req)
                 else:
                     new_running_req.append(running_req)

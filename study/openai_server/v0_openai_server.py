@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Expose the educational v1 Qwen2 model through OpenAI-compatible APIs.
+"""Expose the educational v0 Qwen2 model through OpenAI-compatible APIs.
 
 Run:
-    .venv/bin/python study/v1_openai_server.py
+    .venv/bin/python -m study.openai_server.v0_openai_server
 
 The server supports the streaming protocol consumed by ``vllm bench serve``.
-It serializes model execution, while the model itself reuses per-request KV
-cache entries during decode.
+It deliberately serializes model execution because v0 has no request scheduler,
+continuous batching, or per-request KV cache management yet.
 """
 
 import argparse
@@ -28,18 +28,25 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from transformers import AutoConfig, AutoTokenizer
 
-from qwen2_demo import (
-    KVCacheStore,
-    KVCacheType,
-    MODEL_PATH,
-    Qwen2ForCausalLM,
-    VllmStyleWeightLoader,
-    get_device_and_dtype,
-    set_default_dtype,
-)
+try:
+    from study.inference_engine.qwen2_demo import (
+        MODEL_PATH,
+        Qwen2ForCausalLM,
+        VllmStyleWeightLoader,
+        get_device_and_dtype,
+        set_default_dtype,
+    )
+except ImportError:
+    from qwen2_demo import (
+        MODEL_PATH,
+        Qwen2ForCausalLM,
+        VllmStyleWeightLoader,
+        get_device_and_dtype,
+        set_default_dtype,
+    )
 
 
-MODEL_ID = "qwen2-0.5b-instruct-v1"
+MODEL_ID = "qwen2-0.5b-instruct-v0"
 
 
 
@@ -74,7 +81,7 @@ class ChatCompletionRequest(BaseModel):
 
 
 class ModelRuntime:
-    """Own the tokenizer, model, and the v1 single-request execution lock."""
+    """Own the tokenizer, model, and the v0 single-request execution lock."""
 
     def __init__(self) -> None:
         self.device, self.dtype = get_device_and_dtype()
@@ -90,8 +97,9 @@ class ModelRuntime:
         VllmStyleWeightLoader(self.model, self.config).load(MODEL_PATH)
         self.model.eval()
 
-        # v1 still serializes independent requests, but each request reuses its
-        # layer-wise KV cache during decode.
+        # v0 recomputes the full sequence for every token and cannot batch
+        # independently arriving requests. The lock prevents concurrent callers
+        # from racing on the shared MPS model.
         self.inference_lock = threading.Lock()
 
     def tokenize_prompt(self, prompt: str) -> torch.Tensor:
@@ -116,51 +124,10 @@ class ModelRuntime:
 
         eos_token_ids = {self.tokenizer.eos_token_id, self.tokenizer.pad_token_id}
         token_ids = input_ids
-        request_id = 1
-        ids = [request_id]
-        kv_cache_manager: KVCacheStore = {
-            request_id: {
-                KVCacheType.K: {},
-                KVCacheType.V: {},
-            }
-        }
-        max_prefill_chunk_tokens = 1000
 
         with self.inference_lock:
-            for decode_index in range(max_tokens):
-                if decode_index == 0 and prompt_tokens > max_prefill_chunk_tokens:
-                    current_pos = 0
-                    while current_pos < prompt_tokens:
-                        right_index = min(
-                            current_pos + max_prefill_chunk_tokens,
-                            prompt_tokens,
-                        )
-                        logits = self.model(
-                            token_ids[:, current_pos:right_index],
-                            ids,
-                            [current_pos],
-                            kv_cache_manager,
-                            right_index - current_pos,
-                        )
-                        current_pos = right_index
-                elif decode_index == 0:
-                    logits = self.model(
-                        token_ids,
-                        ids,
-                        [0],
-                        kv_cache_manager,
-                        prompt_tokens,
-                    )
-                else:
-                    logits = self.model(
-                        token_ids[:, -1:],
-                        ids,
-                        [prompt_tokens + decode_index - 1],
-                        kv_cache_manager,
-                        1,
-                    )
-
-                next_token = logits.argmax(dim=-1)
+            for _ in range(max_tokens):
+                next_token = self.model(token_ids).argmax(dim=-1)
                 next_token_id = next_token.item()
                 if not ignore_eos and next_token_id in eos_token_ids:
                     break
@@ -185,7 +152,7 @@ class ModelRuntime:
         return text, prompt_tokens, len(token_ids)
 
 
-app = FastAPI(title="Qwen2 v1 OpenAI-compatible server", version="1")
+app = FastAPI(title="Qwen2 v0 OpenAI-compatible server", version="0")
 
 
 def get_runtime(request: Request) -> ModelRuntime:
@@ -360,7 +327,7 @@ async def models(request: Request) -> dict[str, Any]:
                 "id": MODEL_ID,
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "study-v1",
+                "owned_by": "study-v0",
             }
         ],
     }

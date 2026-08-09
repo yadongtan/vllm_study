@@ -29,14 +29,14 @@ wait_ready() {
 
 sample_baseline() {
   local name=$1
-  .venv/bin/python3 study/resource_monitor.py monitor \
+  .venv/bin/python3 study/scripts/resource_monitor.py monitor \
     --output "$result_dir/resources-baseline-$name.csv" --duration 5
 }
 
 run_group() {
   local port=$1 model=$2 prefix=$3 c=$4
   local resource="$result_dir/resources-$prefix-concurrency-$c.csv"
-  .venv/bin/python3 study/resource_monitor.py monitor --output "$resource" &
+  .venv/bin/python3 study/scripts/resource_monitor.py monitor --output "$resource" &
   local monitor_pid=$!
   .venv/bin/vllm bench serve --backend openai \
     --base-url "http://127.0.0.1:$port" --endpoint /v1/completions \
@@ -54,7 +54,7 @@ sample_baseline system_before
 
 if [[ "$run_custom" == 1 ]]; then
   custom_log="$result_dir/custom-server.log"
-  .venv/bin/python3 -m uvicorn study.v2_openai_server:app --host 127.0.0.1 \
+  .venv/bin/python3 -m uvicorn study.openai_server.v2_openai_server:app --host 127.0.0.1 \
     --port 8012 >"$custom_log" 2>&1 &
   custom_pid=$!
   trap 'kill "$custom_pid" 2>/dev/null || true' EXIT
@@ -83,5 +83,5 @@ kill "$vllm_pid" 2>/dev/null || true
 wait "$vllm_pid" 2>/dev/null || true
 trap - EXIT
 
-.venv/bin/python3 study/resource_monitor.py summarize --input-dir "$result_dir" \
+.venv/bin/python3 study/scripts/resource_monitor.py summarize --input-dir "$result_dir" \
   --output "$result_dir/resource-summary.json"

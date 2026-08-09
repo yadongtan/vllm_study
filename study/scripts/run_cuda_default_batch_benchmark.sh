@@ -8,7 +8,7 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
 result_dir="study/cuda_benchmark_results"
 mkdir -p "$result_dir"
 
-.venv/bin/python3 -m uvicorn study.v2_openai_server:app \
+.venv/bin/python3 -m uvicorn study.openai_server.v2_openai_server:app \
   --host 127.0.0.1 \
   --port 8014 \
   >"$result_dir/default-batch-server.log" 2>&1 &

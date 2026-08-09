@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 try:
-    from .qwen2_demo import (
+    from study.inference_engine.qwen2_demo import (
         MODEL_PATH,
         Qwen2ForCausalLM,
         Request as ModelRequest,
@@ -36,7 +36,7 @@ try:
         set_default_dtype,
     )
 except ImportError:
-    # 直接执行 `.venv/bin/python study/v2_openai_server.py` 时使用此分支。
+    # 直接执行脚本时使用此分支。
     from qwen2_demo import (
         MODEL_PATH,
         Qwen2ForCausalLM,

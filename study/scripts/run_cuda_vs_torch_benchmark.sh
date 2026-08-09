@@ -30,15 +30,15 @@ run_backend() {
   local backend=$1 port=$2
   local server_log="$result_dir/$backend-server.log"
   STUDY_USE_CUDA_ATTENTION="$([[ "$backend" == custom-cuda ]] && echo 1 || echo 0)" \
-    .venv/bin/python3 -m uvicorn study.v2_openai_server:app \
+    .venv/bin/python3 -m uvicorn study.openai_server.v2_openai_server:app \
     --host 127.0.0.1 --port "$port" >"$server_log" 2>&1 &
   local server_pid=$!
   trap 'kill "$server_pid" 2>/dev/null || true' RETURN
   wait_ready "$port" "$server_pid" "$server_log"
-  .venv/bin/python3 study/resource_monitor.py monitor \
+  .venv/bin/python3 study/scripts/resource_monitor.py monitor \
     --output "$result_dir/resources-baseline-$backend-loaded.csv" --duration 5
   for concurrency in "${concurrencies[@]}"; do
-    .venv/bin/python3 study/resource_monitor.py monitor \
+    .venv/bin/python3 study/scripts/resource_monitor.py monitor \
       --output "$result_dir/resources-$backend-concurrency-$concurrency.csv" &
     local monitor_pid=$!
     .venv/bin/vllm bench serve --backend openai \
@@ -57,9 +57,9 @@ run_backend() {
   trap - RETURN
 }
 
-.venv/bin/python3 study/resource_monitor.py monitor \
+.venv/bin/python3 study/scripts/resource_monitor.py monitor \
   --output "$result_dir/resources-baseline-system-before.csv" --duration 5
 run_backend custom-cuda 8012
 run_backend torch-sdpa 8012
-.venv/bin/python3 study/resource_monitor.py summarize \
+.venv/bin/python3 study/scripts/resource_monitor.py summarize \
   --input-dir "$result_dir" --output "$result_dir/resource-summary.json"

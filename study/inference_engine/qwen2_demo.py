@@ -37,9 +37,9 @@ import torch
 import torch.nn.functional as F
 from prometheus_client.decorator import append
 try:
-    from study.cuda_attention import ragged_gqa_attention
+    from study.inference_engine.cuda_attention import ragged_gqa_attention
 except ModuleNotFoundError:
-    # Support direct execution via ``python study/qwen2_demo.py``.
+    # Support direct execution via ``python study/inference_engine/qwen2_demo.py``.
     from cuda_attention import ragged_gqa_attention
 # safe_open 可以按名称逐个读取 Safetensors 张量。
 # 这样能够避免一次复制所有权重。

@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from study.cuda_attention import ragged_gqa_attention
+from study.inference_engine.cuda_attention import ragged_gqa_attention
 
 
 def test_ragged_gqa_attention():

@@ -70,7 +70,7 @@ run_benchmarks() {
 cleanup_results
 
 custom_log="$result_dir/custom-server.log"
-.venv/bin/python3 -m uvicorn study.v2_openai_server:app \
+.venv/bin/python3 -m uvicorn study.openai_server.v2_openai_server:app \
   --host 127.0.0.1 \
   --port 8012 \
   >"$custom_log" 2>&1 &

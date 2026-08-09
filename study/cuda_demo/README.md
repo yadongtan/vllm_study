@@ -20,7 +20,7 @@ demo.py
 本文以现有 `demo.py` 为目标，严格按照实际开发顺序说明。每一步都会使用上一步
 已经确定的函数名、参数和返回值。
 
-## 第 0 步：先确定 Python 接口和计算目标
+## 第 0 步：`demo.py`：先确定 Python 接口和计算目标
 
 动手写 CUDA 之前，先明确最终希望怎样调用：
 
@@ -40,7 +40,7 @@ output = add_one(input_tensor)
 C++ 启动函数需要接收一个 `torch::Tensor` 并返回一个 `torch::Tensor`；注册 schema
 也必须是一个 Tensor 输入、一个 Tensor 输出。
 
-## 第 1 步：在 `add_one.cu` 中编写 CUDA kernel
+## 第 1 步：`add_one.cu`：创建 CUDA 函数 `add_one_kernel`
 
 首先写真正运行在 GPU 上的函数：
 
@@ -68,9 +68,16 @@ __global__ void add_one_kernel(
 
 特殊语法含义：
 
-- `template <typename scalar_t>`：同一份 kernel 支持多种浮点 dtype；
+- `template <typename scalar_t>`：同一份 kernel 支持多种浮点 dtype。`scalar_t` 不是
+  固定的 C++ 类型，而是模板的“占位类型”：当输入是 FP32 时它会变成 `float`，
+  输入是 FP16 时变成 `at::Half`，输入是 BF16 时变成 `at::BFloat16`。真正选择哪一种
+  类型，要等 C++ 启动函数在运行时看到 Tensor 的 dtype 后再决定；
 - `__global__`：这个函数从 CPU 端启动，但由 GPU 线程执行；
-- `__restrict__`：告诉编译器输入输出内存不重叠，便于优化；
+- `__restrict__`：这是 C/C++ 的指针限定承诺，表示在这个函数执行期间，编译器可以
+  假设通过 `input` 和 `output` 访问的内存区域不重叠。若没有这个承诺，编译器必须
+  担心写 `output[index]` 会改变随后从 `input[...]` 读取的值，于是可能减少寄存器缓存、
+  重排和向量化等优化。这里输入由 `torch::empty_like` 新建、输出是另一块存储，
+  确实不重叠，所以承诺成立；如果调用者让两个指针指向重叠内存，行为就可能未定义；
 - `blockIdx.x`：当前线程块编号；
 - `blockDim.x`：每个线程块的线程数；
 - `threadIdx.x`：当前线程在线程块内的编号。
@@ -92,7 +99,7 @@ if (index < size)
 完成这一步后，我们有了 GPU kernel，但 Python 和普通 C++ 都还不能直接调用它。
 下一步需要写一个运行在 CPU 侧的 C++ 启动函数。
 
-## 第 2 步：在 `add_one.cu` 中编写 C++ 启动函数
+## 第 2 步：`add_one.cu`：创建 C++ 启动函数 `add_one_cuda`
 
 根据第 0 步的接口约定，C++ 函数接收一个 Tensor，返回一个 Tensor：
 
@@ -103,7 +110,7 @@ torch::Tensor add_one_cuda(const torch::Tensor& input)
 这里的 `add_one_cuda` 是后面 `binding.cpp` 要绑定的函数，因此名字、参数类型、
 `const` 和引用符号都必须保持一致。
 
-### 2.1 检查输入
+### 2.1 `add_one.cu`：检查输入
 
 ```cpp
 TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
@@ -113,7 +120,7 @@ TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
 kernel 使用一维指针连续访问数据，所以要求输入位于 CUDA 且内存连续。检查失败时，
 `TORCH_CHECK` 会抛出 Python 能看到的异常。
 
-### 2.2 创建输出
+### 2.2 `add_one.cu`：创建输出
 
 ```cpp
 auto output = torch::empty_like(input);
@@ -123,7 +130,7 @@ const int64_t size = input.numel();
 `empty_like` 创建与输入 shape、dtype、device 相同的未初始化 Tensor，正好满足第 0
 步的输出约定。`numel()` 得到需要处理的元素总数。
 
-### 2.3 计算 CUDA 启动规模
+### 2.3 `add_one.cu`：计算 CUDA 启动规模
 
 ```cpp
 constexpr int threads = 256;
@@ -133,20 +140,26 @@ const int64_t blocks = (size + threads - 1) / threads;
 每个线程块使用 256 个线程。整数公式 `(size + threads - 1) / threads` 是向上取整，
 确保即使 `size` 不是 256 的整数倍，也有足够线程覆盖全部元素。
 
-### 2.4 使用 PyTorch 当前设备和 stream
+### 2.4 `add_one.cu`：使用 PyTorch 当前设备和 stream
 
 ```cpp
 const c10::cuda::CUDAGuard device_guard(input.device());
 const auto stream = at::cuda::getCurrentCUDAStream(input.device().index());
 ```
 
-- `CUDAGuard`：把当前 CUDA 设备切换到输入所在设备；
-- `getCurrentCUDAStream`：让自定义 kernel 加入 PyTorch 当前 stream。
+- `CUDAGuard`：把当前 C++ 线程的“当前 CUDA 设备”切换到 `input.device()`，并在
+  `device_guard` 离开作用域时恢复原设备。它解决的是多 GPU 场景：如果输入在 GPU 1，
+  但当前线程此前仍选中 GPU 0，后续分配输出、查询 stream 或启动 kernel 可能落到错误
+  的设备。这里用 RAII 对象，是因为构造时切换、析构时自动恢复，即使中途抛异常也能恢复；
+- `getCurrentCUDAStream`：取得输入所在设备上、PyTorch 为当前线程维护的 stream，
+  把 kernel 放进同一条执行队列。CUDA stream 内的操作按提交顺序执行，所以本 stream
+  中先提交的写入会先于本 kernel 完成，本 kernel 的写入也会先于随后提交的读取。
 
-使用当前 stream 很重要，它保证此前的 PyTorch CUDA 运算完成后，本 kernel 才读取
-输入；后续 PyTorch 运算也会等待本 kernel 的结果。
+这并不意味着它会自动等待“所有其他 stream”：如果输入由另一条 stream 产生，调用者
+  仍需使用 PyTorch/CUDA event 建立依赖，或在合适的位置同步。使用 PyTorch 当前 stream
+  的目的，是遵守 PyTorch 自己的异步调度和 stream 依赖规则，而不是无条件全局同步。
 
-### 2.5 根据 Tensor dtype 启动 kernel
+### 2.5 `add_one.cu`：根据 Tensor dtype 启动 kernel
 
 ```cpp
 AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -162,8 +175,45 @@ AT_DISPATCH_FLOATING_TYPES_AND2(
     });
 ```
 
-`input.scalar_type()` 是运行时 dtype。分发宏会为它选择对应的 `scalar_t`，再实例化
-第 1 步定义的模板 kernel。
+`input.scalar_type()` 是运行时 dtype。`AT_DISPATCH_FLOATING_TYPES_AND2` 的名字可以
+拆成：
+
+- `AT`：来自 ATen（PyTorch 的 C++ Tensor 运算库）；
+- `DISPATCH`：根据运行时类型分派到编译期模板实例；
+- `FLOATING_TYPES`：覆盖 ATen 支持的常规浮点类型集合（这里包含 FP32）；
+- `AND2`：在常规集合之外，再额外加入两个类型；本例额外加入 `Half`（FP16）和
+  `BFloat16`（BF16）。
+
+它是一个宏，不是普通意义上需要手动调用的函数。它大致展开成“检查 dtype，然后为
+每个允许的 dtype 生成一个分支”，每个分支中的 `scalar_t` 都是确定的具体类型。
+这样 kernel 既能写成一次模板代码，又能支持多个 Tensor dtype；如果不用它，就必须
+手工为 float、half、bfloat16 分别写分支和 kernel 调用。
+
+`[&] { ... }` 是 C++ Lambda 表达式：
+
+- `[]` 是捕获列表；
+- `&` 表示按引用捕获外层局部变量，因此 Lambda 可以使用 `blocks`、`threads`、
+  `stream`、`input` 和 `output`，而不需要把它们逐个作为参数传入；
+- `{ ... }` 是 Lambda 函数体。
+
+这里为什么既有 `add_one_cuda`，又要写一次
+`add_one_kernel<scalar_t><<<blocks, threads, 0, stream>>>(...)`：
+
+1. `add_one_cuda` 是 CPU 侧的“总控/启动函数”，负责检查 Tensor、分配输出、计算
+   grid/block、选择 dtype 和选择 stream；
+2. `add_one_kernel` 才是 GPU 上由很多线程执行的实际计算函数；
+3. `add_one_cuda` 不会自动知道应该启动哪个 kernel，必须在函数体中明确写出 kernel
+   名称和启动配置；
+4. `<scalar_t>` 是把第 1 步的模板 kernel 实例化成当前 dtype；
+5. `<<<...>>>` 是 CUDA 特有的启动语法，不是普通函数调用语法。
+
+因此调用关系是：
+
+```text
+Python torch.ops
+  -> add_one_cuda（CPU 侧入口）
+      -> add_one_kernel<<<...>>>（GPU 侧并行计算）
+```
 
 kernel 启动配置：
 
@@ -191,7 +241,7 @@ return output;
 
 下一步需要把 `add_one_cuda` 注册成 Python 能通过 PyTorch dispatcher 找到的算子。
 
-## 第 3 步：根据 `add_one_cuda` 编写 `binding.cpp`
+## 第 3 步：`binding.cpp`：声明 `add_one_cuda` 并注册 PyTorch 算子
 
 首先引入 PyTorch C++ 扩展 API：
 
@@ -225,13 +275,28 @@ add_one.cuda.o 中提供 add_one_cuda 的定义
 因此不要在 `binding.cpp` 中写 `#include "add_one.cu"`。包含 `.cu` 相当于复制整个
 源码，容易产生重复定义，也破坏正常的分离编译结构。
 
-### 3.1 定义算子 schema
+### 3.1 `binding.cpp`：定义算子 schema
 
 ```cpp
 TORCH_LIBRARY(study_cuda_demo, m) {
   m.def("add_one(Tensor input) -> Tensor");
 }
 ```
+
+这里的 `study_cuda_demo` 看起来不像字符串，是因为 `TORCH_LIBRARY` 是一个
+预处理宏，而不是普通 C++ 函数。它的第一个参数设计为“标识符”，宏内部会把它
+转换成 PyTorch 注册系统使用的命名空间名称。宏调用结束后，PyTorch 内部保存的
+名称本质上仍然是字符串/符号信息，但源码调用处不写引号。
+
+之所以不写：
+
+```cpp
+TORCH_LIBRARY("study_cuda_demo", m)  // 错误写法
+```
+
+是因为宏需要用这个标识符参与生成内部 C++ 注册对象和静态初始化代码；带引号的
+字符串不能用来组成 C++ 标识符。可以把它理解为“用 C++ 标识符写注册名”，而不是
+把它当作普通字符串参数传给函数。
 
 它来自第 0 步确定的接口：一个 Tensor 输入，一个 Tensor 输出。
 
@@ -247,7 +312,7 @@ TORCH_LIBRARY(study_cuda_demo, m) {
 torch.ops.study_cuda_demo.add_one(input_tensor)
 ```
 
-### 3.2 把 CUDA schema 绑定到第 2 步的函数
+### 3.2 `binding.cpp`：把 CUDA schema 绑定到第 2 步的函数
 
 ```cpp
 TORCH_LIBRARY_IMPL(study_cuda_demo, CUDA, m) {
@@ -262,7 +327,7 @@ TORCH_LIBRARY_IMPL(study_cuda_demo, CUDA, m) {
 输入是 CUDA Tensor 时，dispatcher 会选择这个实现。到这一步，C++/CUDA 侧代码
 已经完整，下一步要把两个源文件编译、链接并加载到当前 Python 进程。
 
-## 第 4 步：在 `__init__.py` 中配置 CUDA 编译环境
+## 第 4 步：`__init__.py`：配置 CUDA 编译环境和 `load()`
 
 本项目的 CUDA toolkit 随 PyTorch wheel 安装，路径是：
 
@@ -298,7 +363,7 @@ load = _cpp_extension.load
 
 完成这一步后，Python 已经知道应该使用哪个 `nvcc`、CUDA 头文件和运行库。
 
-## 第 5 步：在 `__init__.py` 中编译并加载扩展
+## 第 5 步：`__init__.py`：编译 `binding.cpp`/`add_one.cu` 并加载扩展
 
 先确定源文件和独立构建目录：
 
@@ -369,7 +434,7 @@ def _load_extension():
     _loaded = True
 ```
 
-## 第 6 步：在 `__init__.py` 中提供 Python 包装函数
+## 第 6 步：`__init__.py`：创建 Python 包装函数 `add_one`
 
 扩展加载后，`binding.cpp` 注册的算子已经存在。包装函数只做两件事：
 
@@ -394,7 +459,7 @@ torch.ops.study_cuda_demo.add_one
 dispatcher 看到输入是 CUDA Tensor，选择 `TORCH_LIBRARY_IMPL(..., CUDA, ...)`，进入
 `add_one_cuda`，最后启动第 1 步的 kernel。
 
-## 第 7 步：在 `demo.py` 中调用并验证
+## 第 7 步：`demo.py`：创建输入、调用 `add_one` 并验证
 
 导入第 6 步的包装函数：
 
@@ -427,7 +492,7 @@ torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 如果编译、注册、dtype 分发、指针访问或 kernel 计算任何一层有问题，这里都会失败。
 
-## 第 8 步：运行完整 Demo
+## 第 8 步：`demo.py`：运行完整 Demo
 
 在仓库根目录运行：
 

@@ -35,6 +35,11 @@ import torch
 # F 包含无状态算子；这里使用 SiLU、线性投影和 SDPA Attention。
 import torch.nn.functional as F
 from prometheus_client.decorator import append
+try:
+    from study.cuda_attention import ragged_gqa_attention
+except ModuleNotFoundError:
+    # Support direct execution via ``python study/qwen2_demo.py``.
+    from cuda_attention import ragged_gqa_attention
 # safe_open 可以按名称逐个读取 Safetensors 张量。
 # 这样能够避免一次复制所有权重。
 from safetensors import safe_open
@@ -405,23 +410,17 @@ class Qwen2Attention(nn.Module):
         # Key 必须使用相同的旋转位置编码；Value 不使用 RoPE。
         key = key * cos + rotate_half(key) * sin
 
-        # 14 个 Query 头共享 2 个 KV 头。
-        # 因此每个 KV 头服务 14/2=7 个 Q 头。
-        num_groups = self.num_heads // self.num_kv_heads
-        # 为教学上的普通 SDPA 显式复制 Key，使头数从 2 变成 14。
-        key = key.repeat_interleave(num_groups, dim=0)
-        # Value 同样从 [B,2,S,64] 扩展为 [B,14,S,64]。
-        value = value.repeat_interleave(num_groups, dim=0)
+        # Keep compact GQA K/V; the CUDA operator maps Q heads to KV heads.
         # PyTorch SDPA 执行缩放点积、因果遮罩、Softmax，
         # 然后把注意力概率与 Value 相乘。
         # if batch_size != 1 or len(ids) != 1 or len(query_start_loc) != 1:
         #     raise NotImplementedError(
         #         "This minimal KV cache demo supports batch_size=1"
         #     )
-        batch_attention_mask:list[torch.Tensor] = []
-
         full_key_chunks: list[torch.Tensor] = []
         full_value_chunks: list[torch.Tensor] = []
+        past_lens: list[int] = []
+        q_lens: list[int] = []
 
         # 先将当前的输入qkv拆分开，待会再跟缓存合并为一个超大矩阵
         k_split: list[torch.Tensor] = []
@@ -433,11 +432,12 @@ class Qwen2Attention(nn.Module):
             query_right = query_start_loc[request_index + 1]
             k_split.append(key[:, query_left:query_right, :])
             v_split.append(value[:, query_left:query_right, :])
+            q_lens.append(query_right - query_left)
 
         for request_index in range(len(ids)):
             request_cache = kv_cache_manager[ids[request_index].req_id]
             start_position = ids[request_index].start
-            attention_mask = None
+            past_lens.append(start_position)
             # 非首次prefill则一定有缓存
             if start_position > 0:
                 k_cache = request_cache[KVCacheType.K][layer_index]
@@ -464,68 +464,42 @@ class Qwen2Attention(nn.Module):
                 request_cache[KVCacheType.K][layer_index] = all_k
                 request_cache[KVCacheType.V][layer_index] = all_v
 
-        key = torch.cat(full_key_chunks, dim=1)
-        value = torch.cat(full_value_chunks, dim=1)
+        key = torch.cat(full_key_chunks, dim=1).contiguous()
+        value = torch.cat(full_value_chunks, dim=1).contiguous()
+        query = query.contiguous()
 
-        # mask的形状是[本次全部请求的query长度, 全部请求历史key+本次key的长度]，或者可以理解为query_len(this_time_all) * k_len(all_time_all)
-        # 每个请求应该只能有一个小mask块即 [该请求的本次query长度, 该请求历史key长度 + 本次请求的key的长度]
-        # 每个小块的在mask中的维度都需要进行偏移，以保证只与自己的kv相乘
-        # 比如本次一共6个q（不包含历史），前4个是请求1的，后2两个是请求2的，那么query维度就是0~4是请求1，4~6是请求2
-        # 对k，这两个请求第一个请求上历史key有10个，第二个请求算上历史key一共有20个
-        # 那么在mask的v维度上0~10是请求1的，10～30是请求2
-        # 那么第一个请求的小mask形状就是[4,10],第二个请求的mask形状就是[2,20]
-        # 他们的形状在大mask中就是[0:4, 0:10] = [4,10], [4:6, 10:30] = [2,20]，整个mask.shape=[6,30]
-        attention_mask = torch.zeros(
-            query.shape[1],
-            key.shape[1],
-            dtype=torch.bool,
-            device=hidden_states.device,
+        # Ragged metadata replaces the dense cross-request causal mask.
+        query_start = torch.tensor(
+            query_start_loc, device=hidden_states.device, dtype=torch.long
         )
-
-        # 填充请求自己的因果区域：
-        q_offset = 0
-        k_offset = 0
-        # 需要知道每个q的位置
-        for request_index in range(len(ids)):
-            query_left = query_start_loc[request_index]
-            query_right = query_start_loc[request_index + 1]
-            query_len = query_right - query_left
-            k_len = full_key_chunks[request_index].shape[1]
-
-            past_len = k_len - query_len
-            query_positions = torch.arange(query_len, device=hidden_states.device)
-            # [0, 1, 2, ..., query_len-1]
-            key_positions = torch.arange(k_len, device=hidden_states.device)
-            # [0, 1, 2, ..., k_len-1]
-            # mask
-            local_mask = key_positions[None, :] <= (
-                    past_len + query_positions[:, None]
+        q_lens_tensor = torch.tensor(
+            q_lens, device=hidden_states.device, dtype=torch.long
+        )
+        past_lens_tensor = torch.tensor(
+            past_lens, device=hidden_states.device, dtype=torch.long
+        )
+        kv_lens_tensor = past_lens_tensor + q_lens_tensor
+        kv_start = torch.cat(
+            (
+                torch.zeros(1, device=hidden_states.device, dtype=torch.long),
+                kv_lens_tensor,
             )
-            attention_mask[q_offset:q_offset+query_len, k_offset:k_offset + k_len] = local_mask
-            q_offset += query_len
-            k_offset += k_len
-
-
-        # key,value已经还原，query可能是batch，需要mask重新拼接
-        attention = F.scaled_dot_product_attention(
+        ).cumsum(0)
+        attention = ragged_gqa_attention(
             query,
             key,
             value,
-            attn_mask=attention_mask,
-            # 推理阶段不使用 dropout。
-            dropout_p=0.0,
-            # 因果遮罩保证位置 i 不能看到位置 i 之后的 token。
-            is_causal=attention_mask is None,
+            query_start,
+            kv_start,
+            past_lens_tensor,
+            q_lens_tensor,
+            int(kv_lens_tensor.max().item()),
+            self.head_dim**-0.5,
         )
-        print("q.shape: ", query.shape, ", k.shape: ", key.shape, ", v.shape: ", value.shape)
-        print("attention.shape before: ", attention.shape)
-        # [14,S,64] 先转成 [S,14,64]，再合并头得到 [S,896]。
-        attention = attention.transpose(0, 1).reshape(
-            sequence_length, self.q_size
+
+        return self.o_proj(
+            attention.transpose(0, 1).reshape(sequence_length, self.q_size)
         )
-        print("attention.shape after: ", attention.shape)
-        # 输出投影融合各注意力头，返回 [B,S,hidden_size]。
-        return self.o_proj(attention)
 
 
 class Qwen2MLP(nn.Module):

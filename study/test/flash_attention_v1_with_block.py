@@ -1,13 +1,12 @@
 import torch
 
-
-
 # 加入mask，
 # todo 并进行按块运算，不再只按单个k和单个v运算
 def test_with_mask(q: torch.Tensor,
          k_T: torch.Tensor,
          v: torch.Tensor,
-         mask: torch.Tensor,):
+         mask: torch.Tensor,
+         block_size: int,):
     o = torch.zeros_like(q)
     head_dim = q.shape[1]
     for q_idx in range(q.shape[0]):
@@ -16,17 +15,21 @@ def test_with_mask(q: torch.Tensor,
         accumulate_dtype = q_token.dtype
         max_score = torch.full((), -torch.inf, dtype=accumulate_dtype,device=q_token.device)
         sum_exp_scores = torch.full((),0, dtype=accumulate_dtype,device=q_token.device)
-        for k_block_idx in range(k_T.shape[1]):
-            if not mask[q_idx][k_block_idx]:
+        for k_block_idx in range(0, k_T.shape[1], block_size):
+            mask_block = mask[q_idx][k_block_idx:k_block_idx + block_size].unsqueeze(0)
+            # 遍历mask_block，是否全部跳过
+            if torch.all(mask_block == 0):
                 continue
-            k_block = k_T[:, k_block_idx:k_block_idx + 1]
+            k_block = k_T[:, k_block_idx:k_block_idx + block_size]
             print("q_token: ", q_token.shape, "k_T: ", k_block.shape)
             # 得到部分Attention
             scores = q_token @ k_block * head_dim ** (-0.5)
             print(f"q_token {q_token} @ k_T: {k_block} = score: {scores}")
-            # 对scores进行softmax，先不缩放了，反正逻辑是一样的
-            print(f"socres softmax before: {scores}")
+            # 进行mask
+            scores = scores.masked_fill(mask_block == 0, -torch.inf)
             scores,this_max_score,this_sum_exp_scores = softmax(scores, max_score)
+            print("scores.shape: ", scores.shape, ", mask_block.shape: ", mask_block.shape)
+
             last_max_score = max_score #记录上一次最大值
             max_score = this_max_score #取最大值
             last_sum_exp_scores = sum_exp_scores # 上一次 sum(e**(x_i-max))
@@ -36,12 +39,11 @@ def test_with_mask(q: torch.Tensor,
             new_output_1 = last_output * last_sum_exp_scores * torch.exp(last_max_score-max_score)
             print(f"socres softmax after: {scores}")
             # 拿到对应的v
-            v_block = v[k_block_idx:k_block_idx + 1, :]
+            v_block = v[k_block_idx:k_block_idx + block_size, :]
             print("scores.shpe: ", scores.shape, ", v.shape: ", v_block.shape)
             output = scores @ v_block
             print(f"scores {scores.shape} @ v_block {v_block.shape} = output {output.shape}")
-            new_output_2 = output * this_sum_exp_scores
-            output = (new_output_1 + new_output_2) / sum_exp_scores
+            output = (new_output_1 + output) / sum_exp_scores
             o[q_idx] = output[0] #假设只有一行结果
     print("o: ", o)
 
@@ -51,7 +53,7 @@ def softmax(scores: torch.Tensor,last_max_score: torch.Tensor) -> torch.Tensor:
     exp_scores = torch.exp(scores - max_score) # ℓ
     # e**(x_i-max) / sum(e**(x_i-max))
     sum_exp_scores = torch.sum(exp_scores, dim=1)
-    return exp_scores / sum_exp_scores, max_score, sum_exp_scores
+    return exp_scores, max_score, sum_exp_scores
 
 
 
@@ -84,6 +86,7 @@ if __name__ == "__main__":
                       [9,  10, 11, 12],
                       [13, 14, 15, 16],
                       [17, 18, 19, 20]], dtype=torch.float32) # [1,5,4]
-    test_with_mask(q, k_T, v, mask)
+    block_size = 2
+    test_with_mask(q, k_T, v, mask, 2)
 
 

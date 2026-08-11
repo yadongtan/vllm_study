@@ -1,0 +1,93 @@
+{
+  "date": "2026-08-11T15:30:42.106142+08:00",
+  "platform": "macOS-15.5-arm64-arm-64bit",
+  "python": "3.12.13",
+  "torch": "2.11.0",
+  "device": "mps",
+  "dtype": "torch.float16",
+  "num_q_heads": 14,
+  "num_kv_heads": 2,
+  "head_dim": 64,
+  "block_size": 16,
+  "warmups": 1,
+  "results": [
+    {
+      "name": "decode-kv-1000",
+      "query_len": 1,
+      "kv_len": 1000,
+      "iterations": 20,
+      "block_size": 16,
+      "max_abs_error_vs_sdpa": 0.0,
+      "correct_vs_sdpa": true,
+      "custom": {
+        "elapsed_seconds": 1.0161004170076922,
+        "mean_latency_ms": 50.80502085038461,
+        "calls_per_second": 19.68309397893751,
+        "query_tokens_per_second": 19.68309397893751,
+        "score_elements_per_second": 275563.31570512516,
+        "estimated_tflops": 7.054420882051204e-05
+      },
+      "sdpa": {
+        "elapsed_seconds": 0.006770915992092341,
+        "mean_latency_ms": 0.33854579960461706,
+        "calls_per_second": 2953.810093546829,
+        "query_tokens_per_second": 2953.810093546829,
+        "score_elements_per_second": 41353341.30965561,
+        "estimated_tflops": 0.010586455375271836
+      },
+      "custom_to_sdpa_latency_ratio": 150.06838339072317
+    },
+    {
+      "name": "prefill-250",
+      "query_len": 250,
+      "kv_len": 250,
+      "iterations": 5,
+      "block_size": 16,
+      "max_abs_error_vs_sdpa": 0.000244140625,
+      "correct_vs_sdpa": true,
+      "custom": {
+        "elapsed_seconds": 0.05479704198660329,
+        "mean_latency_ms": 10.959408397320658,
+        "calls_per_second": 91.24580120989731,
+        "query_tokens_per_second": 22811.450302474328,
+        "score_elements_per_second": 79840076.05866015,
+        "estimated_tflops": 0.020439059471017
+      },
+      "sdpa": {
+        "elapsed_seconds": 0.00316737501998432,
+        "mean_latency_ms": 0.633475003996864,
+        "calls_per_second": 1578.5942518498339,
+        "query_tokens_per_second": 394648.56296245847,
+        "score_elements_per_second": 1381269970.3686047,
+        "estimated_tflops": 0.35360511241436277
+      },
+      "custom_to_sdpa_latency_ratio": 17.30045909968519
+    },
+    {
+      "name": "prefill-1000",
+      "query_len": 1000,
+      "kv_len": 1000,
+      "iterations": 3,
+      "block_size": 16,
+      "max_abs_error_vs_sdpa": 0.00048828125,
+      "correct_vs_sdpa": true,
+      "custom": {
+        "elapsed_seconds": 0.5547835839970503,
+        "mean_latency_ms": 184.9278613323501,
+        "calls_per_second": 5.4075140046248205,
+        "query_tokens_per_second": 5407.514004624821,
+        "score_elements_per_second": 75705196.06474748,
+        "estimated_tflops": 0.019380530192575355
+      },
+      "sdpa": {
+        "elapsed_seconds": 0.04671495800721459,
+        "mean_latency_ms": 15.571652669071531,
+        "calls_per_second": 64.21925926887667,
+        "query_tokens_per_second": 64219.25926887667,
+        "score_elements_per_second": 899069629.7642734,
+        "estimated_tflops": 0.230161825219654
+      },
+      "custom_to_sdpa_latency_ratio": 11.875930272941062
+    }
+  ]
+}

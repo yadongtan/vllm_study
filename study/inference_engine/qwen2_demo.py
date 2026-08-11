@@ -30,6 +30,9 @@ import os
 import queue
 import threading
 import traceback
+from study.inference_engine.pytorch_attention.pytorch_flash_attention_v1 import (
+    pytorch_flash_attention_v1,
+)
 
 # torch 提供张量、设备、数据类型及推理模式等基础能力。
 import torch
@@ -437,20 +440,19 @@ class Qwen2Attention(nn.Module):
             start_position = ids[request_index].start
             past_lens.append(start_position)
             # 非首次prefill则一定有缓存
+            # print("layer[", layer_index, "], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
             if start_position > 0:
                 k_cache = request_cache[KVCacheType.K][layer_index]
                 v_cache = request_cache[KVCacheType.V][layer_index]
                 cache_length = k_cache.shape[1]
                 assert cache_length == start_position
-                # print("layer[", layer_index,"], use cache before, key.shape: ", key.shape, ", value.shape: ", value.shape)
                 # key = torch.cat((k_cache, key), dim=1)
                 # value = torch.cat((v_cache, value), dim=1)
                 all_k = torch.cat((k_cache, k_split[request_index]), dim=1)
                 all_v = torch.cat((v_cache, v_split[request_index]), dim=1)
                 full_key_chunks.append(all_k)
                 full_value_chunks.append(all_v)
-
-                # print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
+                print("layer[", layer_index,"], use cache after, key.shape: ", key.shape, ", value.shape: ", value.shape)
                 # 重新定义mask矩阵
                 request_cache[KVCacheType.K][layer_index] = all_k
                 request_cache[KVCacheType.V][layer_index] = all_v
@@ -484,7 +486,50 @@ class Qwen2Attention(nn.Module):
             )
         ).cumsum(0)
         scale = self.head_dim**-0.5
-        if os.environ.get("STUDY_USE_CUDA_ATTENTION", "1") == "0":
+
+        attention_mask = torch.zeros(
+            query.shape[1], key.shape[1], dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        q_offset = 0
+        k_offset = 0
+        for request_index in range(len(ids)):
+            query_len = q_lens[request_index]
+            kv_len = int(kv_lens_tensor[request_index].item())
+            query_positions = torch.arange(
+                query_len, device=hidden_states.device
+            )
+            key_positions = torch.arange(
+                kv_len, device=hidden_states.device
+            )
+            local_mask = key_positions[None, :] <= (
+                    past_lens[request_index] + query_positions[:, None]
+            )
+            attention_mask[
+                q_offset:q_offset + query_len,
+                k_offset:k_offset + kv_len,
+            ] = local_mask
+            q_offset += query_len
+            k_offset += kv_len
+
+        # 使用自己python实现的flash attention
+        if os.environ.get("STUDY_USE_PYTORCH_FLASH_ATTENTION_V1", "0") == "1":
+            attention = pytorch_flash_attention_v1(
+                query,
+                key,
+                value,
+                attention_mask,
+                128
+            )
+        # pytorch提供的attention
+        elif os.environ.get("STUDY_USE_CUDA_ATTENTION", "0") == "1":
+            # cuda实现的attention
+            attention = ragged_gqa_attention(
+                query, key, value, query_start, kv_start,
+                past_lens_tensor, q_lens_tensor,
+                int(kv_lens_tensor.max().item()), scale,
+            )
+        else:
             dense_key = key.repeat_interleave(
                 self.num_heads // self.num_kv_heads, dim=0
             )
@@ -507,7 +552,7 @@ class Qwen2Attention(nn.Module):
                     kv_len, device=hidden_states.device
                 )
                 local_mask = key_positions[None, :] <= (
-                    past_lens[request_index] + query_positions[:, None]
+                        past_lens[request_index] + query_positions[:, None]
                 )
                 attention_mask[
                     q_offset:q_offset + query_len,
@@ -523,12 +568,6 @@ class Qwen2Attention(nn.Module):
                 dropout_p=0.0,
                 is_causal=False,
                 scale=scale,
-            )
-        else:
-            attention = ragged_gqa_attention(
-                query, key, value, query_start, kv_start,
-                past_lens_tensor, q_lens_tensor,
-                int(kv_lens_tensor.max().item()), scale,
             )
         if os.environ.get("STUDY_DEBUG_FINITE") == "1" and not torch.isfinite(
             attention

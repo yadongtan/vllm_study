@@ -43,6 +43,18 @@ int main() {
   cudaDeviceProp device_properties{};
   cudaGetDevice(&device_index);
   cudaGetDeviceProperties(&device_properties, device_index);
+
+  // 从 CUDA 搬到 CPU，同时将 BFloat16 转换为 Float32。
+  // contiguous() 保证数据按连续数组排列，便于通过指针查看。
+  const auto actual_float_cpu =
+      actual.cpu().to(torch::kFloat32).contiguous();
+
+  // actual_float_cpu 现在确实是 Float32，因此可以获取 float*。
+  const float* actual_data = actual_float_cpu.data_ptr<float>();
+
+  // 将 GDB 断点设置在这行，确保 actual_data 已完成初始化。
+  const int debug_breakpoint = 0;
+
   std::cout << "device: " << device_properties.name << '\n';
   std::cout << "input[:8]:  " << input.slice(0, 0, 8) << '\n';
   std::cout << "output[:8]: " << actual.slice(0, 0, 8) << '\n';

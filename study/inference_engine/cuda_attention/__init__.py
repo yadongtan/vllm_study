@@ -32,7 +32,11 @@ def _load_extension() -> None:
     load(
         name="study_cuda_attention",
         build_directory=str(build_directory),
-        sources=[str(root / "binding.cpp"), str(root / "ragged_gqa_attention.cu")],
+        sources=[
+            str(root / "binding.cpp"),
+            str(root / "ragged_gqa_attention.cu"),
+            str(root / "cuda_flash_attention_v1.cu"),
+        ],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
         extra_ldflags=[str(_cuda_root / "lib" / "libcudart.so.13")],
@@ -51,4 +55,11 @@ def ragged_gqa_attention(query, key, value, query_start_loc, kv_start_loc,
         max_kv_len, scale)
 
 
-__all__ = ["ragged_gqa_attention"]
+def cuda_flash_attention_v1(q, k, v, mask, query_start, kv_start,
+                            q_block_size, kv_block_size):
+    _load_extension()
+    return torch.ops.study_cuda.cuda_flash_attention_v1(
+        q, k, v, mask, query_start, kv_start, q_block_size, kv_block_size)
+
+
+__all__ = ["cuda_flash_attention_v1", "ragged_gqa_attention"]

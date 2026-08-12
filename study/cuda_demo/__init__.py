@@ -57,7 +57,10 @@ def _load_extension() -> None:
         # 所有 .o、.so 和 Ninja 文件都限定在本 Demo 的 build 目录。
         build_directory=str(build_directory),
         # binding.cpp 注册算子；add_one.cu 实现启动函数和 GPU kernel。
-        sources=[str(root / "binding.cpp"), str(root / "add_one.cu")],
+        sources=[
+            str(root / "binding.cpp"),
+            str(root / "add_one.cu"),
+        ],
         # 传给宿主 C++ 编译器（通常为 g++）的优化参数。
         extra_cflags=["-O3"],
         # 传给 nvcc：优化、快速数学近似和性能分析所需源码行号。

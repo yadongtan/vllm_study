@@ -40,10 +40,13 @@ import torch
 import torch.nn.functional as F
 from prometheus_client.decorator import append
 try:
-    from study.inference_engine.cuda_attention import ragged_gqa_attention
+    from study.inference_engine.cuda_attention import (
+        cuda_flash_attention_v1,
+        ragged_gqa_attention,
+    )
 except ModuleNotFoundError:
     # Support direct execution via ``python study/inference_engine/qwen2_demo.py``.
-    from cuda_attention import ragged_gqa_attention
+    from cuda_attention import cuda_flash_attention_v1, ragged_gqa_attention
 # safe_open 可以按名称逐个读取 Safetensors 张量。
 # 这样能够避免一次复制所有权重。
 from safetensors import safe_open
@@ -487,33 +490,68 @@ class Qwen2Attention(nn.Module):
         ).cumsum(0)
         scale = self.head_dim**-0.5
 
-        attention_mask = torch.zeros(
-            query.shape[1], key.shape[1], dtype=torch.bool,
-            device=hidden_states.device,
-        )
-        q_offset = 0
-        k_offset = 0
-        for request_index in range(len(ids)):
-            query_len = q_lens[request_index]
-            kv_len = int(kv_lens_tensor[request_index].item())
-            query_positions = torch.arange(
-                query_len, device=hidden_states.device
+        # 使用自己 CUDA 实现的 flash attention。CUDA 算子接收标准的
+        # [B, H, S, D]，这里为打包后的三维 Q/K/V 临时增加 batch 维。
+        if os.environ.get("STUDY_USE_CUDA_FLASH_ATTENTION_V1", "0") == "1":
+            compact_mask = torch.zeros(
+                query.shape[1],
+                query.shape[1],
+                dtype=torch.bool,
+                device=hidden_states.device,
             )
-            key_positions = torch.arange(
-                kv_len, device=hidden_states.device
-            )
-            local_mask = key_positions[None, :] <= (
-                    past_lens[request_index] + query_positions[:, None]
-            )
-            attention_mask[
-                q_offset:q_offset + query_len,
-                k_offset:k_offset + kv_len,
-            ] = local_mask
-            q_offset += query_len
-            k_offset += kv_len
+            for request_index in range(len(ids)):
+                query_left = query_start_loc[request_index]
+                query_right = query_start_loc[request_index + 1]
+                query_len = query_right - query_left
+                compact_mask[
+                    query_left:query_right,
+                    query_left:query_right,
+                ] = torch.tril(
+                    torch.ones(
+                        query_len,
+                        query_len,
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
+                )
 
+            attention = cuda_flash_attention_v1(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                compact_mask.contiguous(),
+                query_start.contiguous(),
+                kv_start.contiguous(),
+                32,
+                32,
+            ).squeeze(0)
         # 使用自己python实现的flash attention
-        if os.environ.get("STUDY_USE_PYTORCH_FLASH_ATTENTION_V1", "0") == "1":
+        elif os.environ.get("STUDY_USE_PYTORCH_FLASH_ATTENTION_V1", "0") == "1":
+            attention_mask = torch.zeros(
+                query.shape[1], key.shape[1], dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            q_offset = 0
+            k_offset = 0
+            for request_index in range(len(ids)):
+                query_len = q_lens[request_index]
+                kv_len = int(kv_lens_tensor[request_index].item())
+                query_positions = torch.arange(
+                    query_len, device=hidden_states.device
+                )
+                key_positions = torch.arange(
+                    kv_len, device=hidden_states.device
+                )
+                local_mask = key_positions[None, :] <= (
+                    past_lens[request_index] + query_positions[:, None]
+                )
+                attention_mask[
+                    q_offset:q_offset + query_len,
+                    k_offset:k_offset + kv_len,
+                ] = local_mask
+                q_offset += query_len
+                k_offset += kv_len
+
             attention = pytorch_flash_attention_v1(
                 query,
                 key,

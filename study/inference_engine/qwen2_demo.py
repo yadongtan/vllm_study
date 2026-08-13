@@ -315,6 +315,71 @@ class KVCacheType(Enum):
 # request_id -> cache type -> layer index -> cached tensor。
 KVCacheStore = dict[int, dict[KVCacheType, dict[int, torch.Tensor]]]
 
+# V2 每轮 batch 只构造一次有效 tile 工作表，24 个 Decoder layer 共同复用。
+# tuple 内容依次为 work_items、每个 Q token 的 partial 起点、partial 数量，
+# 以及单个 Q head 实际需要的 packed partial 总数。
+CudaFlashV2Work = tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]
+
+
+def build_cuda_flash_v2_work(
+    ids: list[Request],
+    query_start_loc: list[int],
+    device: torch.device,
+    q_block_size: int = 32,
+    kv_block_size: int = 32,
+) -> CudaFlashV2Work:
+    """只为同一请求的 Q/KV tile 组合创建 CUDA 工作项。"""
+    work_items: list[list[int]] = []
+    partial_start: list[int] = []
+    partial_count: list[int] = []
+    request_partial_base = 0
+    kv_global_start = 0
+
+    for request_index, req in enumerate(ids):
+        q_global_start = query_start_loc[request_index]
+        q_len = query_start_loc[request_index + 1] - q_global_start
+        kv_len = req.start + q_len
+        num_kv_tiles = (kv_len + kv_block_size - 1) // kv_block_size
+
+        # 同一请求的每个 query row 只归约该请求自己的 KV tiles。
+        for q_local in range(q_len):
+            partial_start.append(
+                request_partial_base + q_local * num_kv_tiles
+            )
+            partial_count.append(num_kv_tiles)
+
+        for q_tile_local in range(0, q_len, q_block_size):
+            q_tile_len = min(q_block_size, q_len - q_tile_local)
+            for kv_tile_local in range(0, kv_len, kv_block_size):
+                kv_tile_len = min(kv_block_size, kv_len - kv_tile_local)
+                kv_tile_index = kv_tile_local // kv_block_size
+                # 每项 8 个 int64：请求、Q 起点/长度、KV 起点/长度、
+                # 当前 Q tile 的 packed partial 起点、KV tile 局部编号、
+                # 以及当前请求的 KV tile 数量。
+                work_items.append(
+                    [
+                        request_index,
+                        q_global_start + q_tile_local,
+                        q_tile_len,
+                        kv_global_start + kv_tile_local,
+                        kv_tile_len,
+                        request_partial_base
+                        + q_tile_local * num_kv_tiles,
+                        kv_tile_index,
+                        num_kv_tiles,
+                    ]
+                )
+
+        request_partial_base += q_len * num_kv_tiles
+        kv_global_start += kv_len
+
+    return (
+        torch.tensor(work_items, device=device, dtype=torch.long),
+        torch.tensor(partial_start, device=device, dtype=torch.long),
+        torch.tensor(partial_count, device=device, dtype=torch.long),
+        request_partial_base,
+    )
+
 class Qwen2Attention(nn.Module):
     """带 Grouped Query Attention 和融合 QKV 参数的自注意力层。"""
 
@@ -384,6 +449,7 @@ class Qwen2Attention(nn.Module):
         query_start_loc: list[int],
         kv_cache_manager: KVCacheStore,
         layer_index: int,
+        cuda_flash_v2_work: CudaFlashV2Work | None = None,
     ) -> torch.Tensor:
         """计算一层因果自注意力，输入和输出均为 [B, S, 896]。"""
 
@@ -529,6 +595,10 @@ class Qwen2Attention(nn.Module):
         # v2 直接接收打包后的三维 [H, S, D] Q/K/V。
         if use_cuda_flash_attention_v2:
             assert compact_mask is not None
+            assert cuda_flash_v2_work is not None
+            work_items, partial_start, partial_count, partials_per_head = (
+                cuda_flash_v2_work
+            )
             attention = cuda_flash_attention_v2(
                 query,
                 key,
@@ -536,6 +606,10 @@ class Qwen2Attention(nn.Module):
                 compact_mask.contiguous(),
                 query_start.contiguous(),
                 kv_start.contiguous(),
+                work_items,
+                partial_start,
+                partial_count,
+                partials_per_head,
                 32,
                 32,
             )
@@ -708,6 +782,7 @@ class Qwen2DecoderLayer(nn.Module):
         ids: list[Request],
         query_start_loc: list[int],
         kv_cache_manager: KVCacheStore,
+        cuda_flash_v2_work: CudaFlashV2Work | None = None,
     ) -> torch.Tensor:
         """依次执行归一化、Attention、残差、归一化、MLP、残差。"""
         # 保存 Attention 分支的输入，用于第一次残差连接。
@@ -723,6 +798,7 @@ class Qwen2DecoderLayer(nn.Module):
             query_start_loc,
             kv_cache_manager,
             self.layer_index,
+            cuda_flash_v2_work,
         )
 
         # 保存 Attention 残差结果，作为 MLP 分支的残差。
@@ -784,6 +860,13 @@ class Qwen2Model(nn.Module):
             # cos/sin 使用与隐藏状态一致的 FP16/BF16/FP32 类型。
             hidden_states.dtype,
         )
+        cuda_flash_v2_work = None
+        if os.environ.get("STUDY_USE_CUDA_FLASH_ATTENTION_V2", "0") == "1":
+            cuda_flash_v2_work = build_cuda_flash_v2_work(
+                ids,
+                query_start_loc,
+                input_ids.device,
+            )
         # 隐藏状态依次通过 24 层；每层使用相同位置对应的 cos/sin。
         for layer in self.layers:
             hidden_states = layer(
@@ -793,6 +876,7 @@ class Qwen2Model(nn.Module):
                 ids,
                 query_start_loc,
                 kv_cache_manager,
+                cuda_flash_v2_work,
             )
         # 返回最终归一化结果；此时还没有计算词表 logits。
         return self.norm(hidden_states)

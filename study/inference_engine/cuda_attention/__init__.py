@@ -64,10 +64,12 @@ def cuda_flash_attention_v1(q, k, v, mask, query_start, kv_start,
 
 
 def cuda_flash_attention_v2(q, k, v, mask, query_start, kv_start,
-                            q_block_size, kv_block_size):
+                            work_items, partial_start, partial_count,
+                            partials_per_head, q_block_size, kv_block_size):
     _load_extension()
     return torch.ops.study_cuda.cuda_flash_attention_v2(
-        q, k, v, mask, query_start, kv_start, q_block_size, kv_block_size)
+        q, k, v, mask, query_start, kv_start, work_items, partial_start,
+        partial_count, partials_per_head, q_block_size, kv_block_size)
 
 
 __all__ = [

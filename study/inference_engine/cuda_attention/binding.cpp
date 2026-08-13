@@ -28,6 +28,10 @@ torch::Tensor cuda_flash_attention_v2_cuda(
     const torch::Tensor& mask,
     const torch::Tensor& query_start,
     const torch::Tensor& kv_start,
+    const torch::Tensor& work_items,
+    const torch::Tensor& partial_start,
+    const torch::Tensor& partial_count,
+    int64_t partials_per_head,
     int64_t q_block_size,
     int64_t kv_block_size);
 
@@ -41,8 +45,9 @@ TORCH_LIBRARY(study_cuda, m) {
       "int kv_block_size) -> Tensor");
   m.def(
       "cuda_flash_attention_v2(Tensor q, Tensor k, Tensor v, Tensor mask, "
-      "Tensor query_start, Tensor kv_start, int q_block_size, "
-      "int kv_block_size) -> Tensor");
+      "Tensor query_start, Tensor kv_start, Tensor work_items, "
+      "Tensor partial_start, Tensor partial_count, int partials_per_head, "
+      "int q_block_size, int kv_block_size) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(study_cuda, CUDA, m) {

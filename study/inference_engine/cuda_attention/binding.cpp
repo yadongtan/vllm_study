@@ -21,6 +21,16 @@ torch::Tensor cuda_flash_attention_v1_cuda(
     int64_t q_block_size,
     int64_t kv_block_size);
 
+torch::Tensor cuda_flash_attention_v2_cuda(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& mask,
+    const torch::Tensor& query_start,
+    const torch::Tensor& kv_start,
+    int64_t q_block_size,
+    int64_t kv_block_size);
+
 TORCH_LIBRARY(study_cuda, m) {
   m.def("ragged_gqa_attention(Tensor query, Tensor key, Tensor value, "
         "Tensor query_start_loc, Tensor kv_start_loc, Tensor past_lens, "
@@ -29,9 +39,14 @@ TORCH_LIBRARY(study_cuda, m) {
       "cuda_flash_attention_v1(Tensor q, Tensor k, Tensor v, Tensor mask, "
       "Tensor query_start, Tensor kv_start, int q_block_size, "
       "int kv_block_size) -> Tensor");
+  m.def(
+      "cuda_flash_attention_v2(Tensor q, Tensor k, Tensor v, Tensor mask, "
+      "Tensor query_start, Tensor kv_start, int q_block_size, "
+      "int kv_block_size) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(study_cuda, CUDA, m) {
   m.impl("ragged_gqa_attention", &ragged_gqa_attention_cuda);
   m.impl("cuda_flash_attention_v1", &cuda_flash_attention_v1_cuda);
+  m.impl("cuda_flash_attention_v2", &cuda_flash_attention_v2_cuda);
 }

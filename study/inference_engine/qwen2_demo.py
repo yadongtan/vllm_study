@@ -42,11 +42,16 @@ from prometheus_client.decorator import append
 try:
     from study.inference_engine.cuda_attention import (
         cuda_flash_attention_v1,
+        cuda_flash_attention_v2,
         ragged_gqa_attention,
     )
 except ModuleNotFoundError:
     # Support direct execution via ``python study/inference_engine/qwen2_demo.py``.
-    from cuda_attention import cuda_flash_attention_v1, ragged_gqa_attention
+    from cuda_attention import (
+        cuda_flash_attention_v1,
+        cuda_flash_attention_v2,
+        ragged_gqa_attention,
+    )
 # safe_open 可以按名称逐个读取 Safetensors 张量。
 # 这样能够避免一次复制所有权重。
 from safetensors import safe_open
@@ -490,9 +495,15 @@ class Qwen2Attention(nn.Module):
         ).cumsum(0)
         scale = self.head_dim**-0.5
 
-        # 使用自己 CUDA 实现的 flash attention。CUDA 算子接收标准的
-        # [B, H, S, D]，这里为打包后的三维 Q/K/V 临时增加 batch 维。
-        if os.environ.get("STUDY_USE_CUDA_FLASH_ATTENTION_V1", "0") == "1":
+        use_cuda_flash_attention_v1 = (
+            os.environ.get("STUDY_USE_CUDA_FLASH_ATTENTION_V1", "0") == "1"
+        )
+        use_cuda_flash_attention_v2 = (
+            os.environ.get("STUDY_USE_CUDA_FLASH_ATTENTION_V2", "0") == "1"
+        )
+
+        compact_mask = None
+        if use_cuda_flash_attention_v1 or use_cuda_flash_attention_v2:
             compact_mask = torch.zeros(
                 query.shape[1],
                 query.shape[1],
@@ -515,6 +526,22 @@ class Qwen2Attention(nn.Module):
                     )
                 )
 
+        # v2 直接接收打包后的三维 [H, S, D] Q/K/V。
+        if use_cuda_flash_attention_v2:
+            assert compact_mask is not None
+            attention = cuda_flash_attention_v2(
+                query,
+                key,
+                value,
+                compact_mask.contiguous(),
+                query_start.contiguous(),
+                kv_start.contiguous(),
+                32,
+                32,
+            )
+        # v1 接收四维 [B, H, S, D]，这里临时增加大小为 1 的 batch 维。
+        elif use_cuda_flash_attention_v1:
+            assert compact_mask is not None
             attention = cuda_flash_attention_v1(
                 query.unsqueeze(0),
                 key.unsqueeze(0),

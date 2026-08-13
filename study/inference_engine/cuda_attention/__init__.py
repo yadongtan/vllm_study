@@ -36,6 +36,7 @@ def _load_extension() -> None:
             str(root / "binding.cpp"),
             str(root / "ragged_gqa_attention.cu"),
             str(root / "cuda_flash_attention_v1.cu"),
+            str(root / "cuda_flash_attention_v2.cu"),
         ],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
@@ -62,4 +63,15 @@ def cuda_flash_attention_v1(q, k, v, mask, query_start, kv_start,
         q, k, v, mask, query_start, kv_start, q_block_size, kv_block_size)
 
 
-__all__ = ["cuda_flash_attention_v1", "ragged_gqa_attention"]
+def cuda_flash_attention_v2(q, k, v, mask, query_start, kv_start,
+                            q_block_size, kv_block_size):
+    _load_extension()
+    return torch.ops.study_cuda.cuda_flash_attention_v2(
+        q, k, v, mask, query_start, kv_start, q_block_size, kv_block_size)
+
+
+__all__ = [
+    "cuda_flash_attention_v1",
+    "cuda_flash_attention_v2",
+    "ragged_gqa_attention",
+]

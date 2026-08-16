@@ -1,0 +1,38 @@
+Reading model.safetensors...
+Loaded 290 checkpoint tensors into 170 fused model parameters.
+ninja: no work to do.
+/opt/vllm_study/.venv/lib/python3.12/site-packages/torch/profiler/profiler.py:224: UserWarning: Warning: Profiler clears events at the end of each cycle.Only events from the current cycle will be reported.To keep events across cycles, set acc_events=True.
+  _warn_once(
+Captured CUDA Graph for batch_size=8
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      36.688ms        57.19%      36.688ms      18.911us          1940  
+void (anonymous namespace)::paged_gqa_decode_split_g...         0.00%       0.000us         0.00%       0.000us       0.000us      19.736ms        30.76%      19.736ms      41.116us           480  
+void (anonymous namespace)::fused_add_rms_norm_kerne...         0.00%       0.000us         0.00%       0.000us       0.000us       2.270ms         3.54%       2.270ms       2.365us           960  
+void (anonymous namespace)::paged_gqa_decode_split_m...         0.00%       0.000us         0.00%       0.000us       0.000us       1.906ms         2.97%       1.906ms       3.972us           480  
+void (anonymous namespace)::fused_rope_cache_write_k...         0.00%       0.000us         0.00%       0.000us       0.000us       1.117ms         1.74%       1.117ms       2.328us           480  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     767.833us         1.20%     767.833us       1.600us           480  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     723.629us         1.13%     723.629us       1.508us           480  
+void cublasLt::splitKreduce_kernel<32, 16, int, __nv...         0.00%       0.000us         0.00%       0.000us       0.000us     543.800us         0.85%     543.800us       1.133us           480  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     175.676us         0.27%     175.676us       8.784us            20  
+                                            aten::copy_         0.23%     155.695us         1.21%     830.801us      10.385us      81.184us         0.13%      81.184us       1.015us            80  
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us      81.184us         0.13%      81.184us       1.015us            80  
+void at::native::(anonymous namespace)::indexSelectS...         0.00%       0.000us         0.00%       0.000us       0.000us      51.261us         0.08%      51.261us       2.563us            20  
+void (anonymous namespace)::rms_norm_kernel<c10::BFl...         0.00%       0.000us         0.00%       0.000us       0.000us      46.016us         0.07%      46.016us       2.301us            20  
+                                            aten::fill_         0.24%     163.772us         4.58%       3.132ms      78.288us      38.842us         0.06%      40.122us       1.003us            40  
+void at::native::vectorized_elementwise_kernel<2, at...         0.00%       0.000us         0.00%       0.000us       0.000us      38.842us         0.06%      38.842us       0.971us            40  
+                                       Memset (Unknown)         0.00%       0.000us         0.00%       0.000us       0.000us       6.145us         0.01%       6.145us       0.307us            20  
+                                  cudaStreamIsCapturing         0.02%      10.310us         0.02%      10.310us       0.516us       2.943us         0.00%       2.943us       0.147us            20  
+                                Activity Buffer Request         3.84%       2.624ms         3.84%       2.624ms       2.624ms       1.280us         0.00%       1.280us       1.280us             1  
+                                        cudaGraphLaunch         5.59%       3.826ms         5.59%       3.826ms     191.316us       0.800us         0.00%       0.800us       0.040us            20  
+                                            aten::zero_         0.15%     102.372us         4.73%       3.234ms      80.847us       0.000us         0.00%      40.122us       1.003us            40  
+                                       cudaLaunchKernel         0.50%     343.984us         0.50%     343.984us       8.600us       0.000us         0.00%       0.000us       0.000us            40  
+                                        cudaMemcpyAsync         0.99%     675.106us         0.99%     675.106us       8.439us       0.000us         0.00%       0.000us       0.000us            80  
+                                            aten::slice         0.23%     156.900us         0.27%     184.750us       2.309us       0.000us         0.00%       0.000us       0.000us            80  
+                                       aten::as_strided         0.04%      27.850us         0.04%      27.850us       0.348us       0.000us         0.00%       0.000us       0.000us            80  
+                                  cudaDeviceSynchronize        88.18%      60.308ms        88.18%      60.308ms      30.154ms       0.000us         0.00%       0.000us       0.000us             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 68.394ms
+Self CUDA time total: 64.151ms
+

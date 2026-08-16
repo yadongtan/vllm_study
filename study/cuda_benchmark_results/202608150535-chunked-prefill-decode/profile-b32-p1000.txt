@@ -1,0 +1,34 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+void flash::flash_fwd_splitkv_kernel<Flash_fwd_kerne...         0.00%       0.000us         0.00%       0.000us       0.000us      72.893ms        24.23%      72.893ms      30.372us          2400  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      70.623ms        23.48%      70.623ms      29.426us          2400  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      56.698ms        18.85%      56.698ms      11.812us          4800  
+ampere_bf16_s1688gemm_bf16_128x128_ldg8_f2f_stages_3...         0.00%       0.000us         0.00%       0.000us       0.000us      44.713ms        14.86%      44.713ms     447.134us           100  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      16.969ms         5.64%      16.969ms       7.071us          2400  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       8.037ms         2.67%       8.037ms       1.674us          4800  
+std::enable_if<(((8)>(0)))&&vllm::_typeConvert<c10::...         0.00%       0.000us         0.00%       0.000us       0.000us       8.014ms         2.66%       8.014ms       1.670us          4800  
+void flash::flash_fwd_splitkv_combine_kernel<Flash_f...         0.00%       0.000us         0.00%       0.000us       0.000us       6.815ms         2.27%       6.815ms       2.840us          2400  
+void (anonymous namespace)::fused_rope_cache_write_k...         0.00%       0.000us         0.00%       0.000us       0.000us       5.944ms         1.98%       5.944ms       2.477us          2400  
+void vllm::act_and_mul_kernel<c10::BFloat16, __nv_bf...         0.00%       0.000us         0.00%       0.000us       0.000us       4.077ms         1.36%       4.077ms       1.699us          2400  
+void cublasLt::splitKreduce_kernel<32, 16, int, __nv...         0.00%       0.000us         0.00%       0.000us       0.000us       2.934ms         0.98%       2.934ms       1.223us          2400  
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       2.134ms         0.71%       2.134ms      21.340us           100  
+                                            aten::copy_         0.27%     827.231us         7.27%      22.553ms      75.176us     344.086us         0.11%     524.752us       1.749us           300  
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us     344.086us         0.11%     344.086us       1.147us           300  
+void at::native::vectorized_gather_kernel<16, long>(...         0.00%       0.000us         0.00%       0.000us       0.000us     242.852us         0.08%     242.852us       1.214us           200  
+                                    Command Buffer Full        50.06%     155.400ms        50.06%     155.400ms     139.123us     179.002us         0.06%     179.002us       0.160us          1117  
+void vllm::rms_norm_kernel<c10::BFloat16, 8, 3>(c10:...         0.00%       0.000us         0.00%       0.000us       0.000us     159.706us         0.05%     159.706us       1.597us           100  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us      99.870us         0.03%      99.870us       0.999us           100  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      90.431us         0.03%      90.431us       0.904us           100  
+                                       Memset (Unknown)         0.00%       0.000us         0.00%       0.000us       0.000us      31.548us         0.01%      31.548us       0.315us           100  
+                                  cudaStreamIsCapturing         0.01%      44.322us         0.01%      44.322us       0.443us       7.969us         0.00%       7.969us       0.080us           100  
+                                        cudaGraphLaunch         6.32%      19.628ms        52.03%     161.514ms       1.615ms       6.816us         0.00%       6.816us       0.068us           100  
+                                Activity Buffer Request         1.99%       6.173ms         2.16%       6.703ms       2.234ms       3.008us         0.00%      10.752us       3.584us             3  
+                                            aten::slice         0.27%     831.365us         0.32%     993.774us       2.484us       0.000us         0.00%       0.000us       0.000us           400  
+                                       aten::as_strided         0.05%     162.409us         0.05%     162.409us       0.406us       0.000us         0.00%       0.000us       0.000us           400  
+                                        cudaMemcpyAsync         0.96%       2.981ms         6.15%      19.095ms      63.649us       0.000us         0.00%     179.002us       0.597us           300  
+                                           Buffer Flush         0.06%     192.617us         0.06%     199.880us     199.880us       0.000us         0.00%       0.000us       0.000us             1  
+                                  cudaDeviceSynchronize        40.00%     124.161ms        40.00%     124.161ms      62.080ms       0.000us         0.00%       0.000us       0.000us             2  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 310.401ms
+Self CUDA time total: 300.823ms

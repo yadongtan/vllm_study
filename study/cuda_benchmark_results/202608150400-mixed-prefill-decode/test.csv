@@ -1,0 +1,2 @@
+timestamp,gpu_util_pct,gpu_memory_used_mib,gpu_memory_total_mib,gpu_memory_util_pct,cpu_util_pct,memory_used_mib,memory_total_mib,memory_util_pct,gpu_power_w,gpu_temperature_c
+1786722671.0494282,13.0,731.0,16376.0,4.4638495359062045,0.0,969.234375,30907.70703125,3.1358986741398565,8.34,36.0
